@@ -119,3 +119,19 @@ test('toolCallsFrom keeps malformed additional_kwargs arguments as the raw strin
 		[{ id: 'tc1', name: 'normalized', args: {} }],
 	);
 });
+
+test('tokenUsageFrom falls back to llmOutput.estimatedTokenUsage (openai Responses-API path)', () => {
+	const usage = tokenUsageFrom({
+		generations: [[{ text: 'hi' }]],
+		llmOutput: { id: 'resp_1', estimatedTokenUsage: { promptTokens: 42, completionTokens: 7, totalTokens: 49 } },
+	});
+	assert.deepEqual(usage, { inputTokens: 42, outputTokens: 7 });
+});
+
+test('tokenUsageFrom prefers exact message usage_metadata over estimatedTokenUsage', () => {
+	const usage = tokenUsageFrom({
+		generations: [[{ text: 'hi', message: { usage_metadata: { input_tokens: 10, output_tokens: 2 } } }]],
+		llmOutput: { estimatedTokenUsage: { promptTokens: 99, completionTokens: 99 } },
+	});
+	assert.deepEqual(usage, { inputTokens: 10, outputTokens: 2 });
+});

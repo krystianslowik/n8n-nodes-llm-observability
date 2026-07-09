@@ -47,6 +47,18 @@ export function tokenUsageFrom(output: LlmResultLike): {
 	) {
 		return { inputTokens: usageMetadata.input_tokens, outputTokens: usageMetadata.output_tokens };
 	}
+	// @langchain/openai's Responses-API path (auto-selected for gpt-5-family
+	// models) reports usage ONLY here — and, despite the name, it is the
+	// backend-reported count on that path, not an estimate. Last because the
+	// key CAN be a real estimate elsewhere; also survives n8n's N8nLlmTracing
+	// stripping `message` off the shared result (measured live).
+	const estimated = output.llmOutput?.estimatedTokenUsage;
+	if (
+		typeof estimated?.promptTokens === 'number' ||
+		typeof estimated?.completionTokens === 'number'
+	) {
+		return { inputTokens: estimated.promptTokens, outputTokens: estimated.completionTokens };
+	}
 	return {};
 }
 

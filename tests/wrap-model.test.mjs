@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { attachHandler, wrapModelWithTracing } from '../dist/nodes/TraceExporter/shared/wrapModelWithTracing.js';
+import {
+	attachHandler,
+	wrapModelWithTracing,
+	sweepStalePipelines,
+	PIPELINE_LINGER_MS,
+} from '../dist/nodes/TraceExporter/shared/wrapModelWithTracing.js';
 
 const OPTIONS = {
 	traceName: 'spike',
@@ -40,12 +45,51 @@ function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
-test('attachHandler appends to an existing callbacks array without clobbering', () => {
+test('attachHandler PREPENDS to an existing callbacks array without clobbering', () => {
 	const existing = { name: 'n8nLlmTracing' };
 	const model = { callbacks: [existing] };
-	assert.equal(attachHandler(model, { name: 'mine' }), true);
+	const mine = { name: 'mine' };
+	assert.equal(attachHandler(model, mine), true);
 	assert.equal(model.callbacks.length, 2);
-	assert.equal(model.callbacks[0], existing);
+	// Order is load-bearing: n8n's own N8nLlmTracing handler MUTATES the
+	// shared LLMResult in handleLLMEnd (strips `message` from generations);
+	// running first is the only way to see tool_calls/usage_metadata.
+	assert.equal(model.callbacks[0], mine, 'our handler runs before n8n\'s mutating one');
+	assert.equal(model.callbacks[1], existing);
+});
+
+test('handler ordering end-to-end: a mutating co-handler (N8nLlmTracing shape) cannot hide tool_calls/usage from us', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-mutating-cohandler');
+	// Simulates n8n's N8nLlmTracing: strips `message` off the shared result.
+	const mutator = {
+		name: 'n8nLlmTracing',
+		handleLLMEnd(output) {
+			output.generations = output.generations.map((gen) => gen.map((g) => ({ text: g.text })));
+		},
+	};
+	const model = { callbacks: [mutator] };
+	wrapModelWithTracing(ctx, model, { ...OPTIONS, captureToolIO: true }, CREDENTIAL);
+	const ours = model.callbacks[0];
+	assert.notEqual(ours, mutator, 'our handler sits in front');
+
+	ours.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-mut');
+	const output = {
+		generations: [
+			[{ text: '', message: { tool_calls: [{ id: 'c1', name: 'calculator', args: { input: '1+1' } }], usage_metadata: { input_tokens: 11, output_tokens: 3 } } }],
+		],
+		llmOutput: {},
+	};
+	// LangChain starts handlers in array order; ours is synchronous, so it
+	// completes before the mutator touches the shared object.
+	for (const h of model.callbacks) await h.handleLLMEnd?.(output, 'run-mut');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	const llm = spans.find((s) => s.name.startsWith('llm:'));
+	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
+	assert.equal(attrs['gen_ai.usage.input_tokens'], '11', 'usage read before the mutation');
+	assert.ok(String(attrs['gen_ai.tool_calls']).includes('calculator'), 'tool_calls read before the mutation');
 });
 
 test('attachHandler is idempotent for arrays: re-attaching the same handler does not double it', () => {
@@ -367,14 +411,14 @@ test('single-closeRun execution: closeFunction retries the failed root at execut
 	assert.equal(retriedRoot.parentSpanId, undefined, 'the retried root is still parentless');
 	assert.equal(child.parentSpanId, retriedRoot.spanId, "child's parentSpanId matches the root the backend finally got");
 
-	// closeFunction still evicts the registry entry: same executionId now
-	// builds a FRESH pipeline.
+	// closeFunction does NOT evict (the steppable Tools Agent fires it after
+	// every step): same executionId keeps the SAME pipeline.
 	const modelB = { callbacks: [] };
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-root-retry-at-close'), modelB, OPTIONS, CREDENTIAL);
-	assert.notEqual(modelB.callbacks[0], handler, 'registry entry was deleted by closeFunction');
+	assert.equal(modelB.callbacks[0], handler, 'the registry entry survives closeFunction');
 });
 
-test("closeFunction evicts the execution's pipeline: a later wrap call gets a FRESH handler", async () => {
+test('closeFunction keeps the pipeline (V3 steps); the lazy sweep evicts it after the linger window', async () => {
 	const httpCalls = [];
 	const modelA = { callbacks: [] };
 	const { closeFunction } = wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelA, OPTIONS, CREDENTIAL);
@@ -383,11 +427,78 @@ test("closeFunction evicts the execution's pipeline: a later wrap call gets a FR
 
 	await closeFunction();
 
+	// Next agent step of the same execution: SAME handler, same trace.
 	const modelB = { callbacks: [] };
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelB, OPTIONS, CREDENTIAL);
-	const handlerB = modelB.callbacks[0];
+	assert.equal(modelB.callbacks[0], handlerA, 'a step-end close must not split the execution');
 
-	assert.notEqual(handlerB, handlerA, 'evicted execution gets a brand-new handler, not the stale one');
+	// The step-2 wrap cleared the closed mark; a sweep now is a no-op even
+	// past the window.
+	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
+	const modelC = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelC, OPTIONS, CREDENTIAL);
+	assert.equal(modelC.callbacks[0], handlerA, 'a live (re-opened) entry is never swept');
+
+	// Close again and let it linger past the window: swept, fresh pipeline.
+	await closeFunction();
+	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
+	const modelD = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelD, OPTIONS, CREDENTIAL);
+	assert.notEqual(modelD.callbacks[0], handlerA, 'a lingering closed entry is finalized and evicted');
+});
+
+test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace with a matched tool span', async () => {
+	const httpCalls = [];
+	const execId = 'exec-v3-steps';
+	const options = { ...OPTIONS, captureToolIO: true };
+
+	// Step 1: agent calls the model, the model requests a tool.
+	const modelA = { callbacks: [] };
+	const step1 = wrapModelWithTracing(fakeCtx(httpCalls, [], execId), modelA, options, CREDENTIAL);
+	const handler = modelA.callbacks[0];
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
+	handler.handleLLMEnd(
+		{
+			generations: [
+				[{ text: '', message: { tool_calls: [{ id: 'call-1', name: 'calculator', args: { input: '2+2' } }] } }],
+			],
+		},
+		'run-1',
+	);
+	// The engine runs the tool as its own node run; the agent step ends and
+	// n8n fires the closeFunctions collected for that runNode invocation.
+	await step1.closeFunction();
+	await flushMicrotasks();
+	const afterClose = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.ok(
+		!afterClose.some((s) => s.name.startsWith('tool:')),
+		'a step-end close must not flush the pending tool call — its result is still coming',
+	);
+
+	// Step 2: the agent is re-invoked with the tool result and calls the model again.
+	const modelB = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], execId), modelB, options, CREDENTIAL);
+	assert.equal(modelB.callbacks[0], handler, 'step 2 reuses the same pipeline');
+	handler.handleChatModelStart(
+		{ id: ['x', 'openai', 'ChatOpenAI'] },
+		[[{ tool_call_id: 'call-1', content: '4', _getType: () => 'tool' }]],
+		'run-2',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: '2+2 = 4' }]] }, 'run-2');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	const traceIds = new Set(spans.map((s) => s.traceId));
+	assert.equal(traceIds.size, 1, 'both steps land in ONE trace');
+	const parentless = spans.filter((s) => s.parentSpanId === undefined);
+	assert.equal(parentless.length, 1, 'exactly one root across the whole execution');
+	const toolSpan = spans.find((s) => s.name === 'tool:calculator');
+	assert.ok(toolSpan, 'the tool call requested in step 1 is synthesized after step 2');
+	const attrs = Object.fromEntries(toolSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
+	assert.equal(attrs['tool.output'], '4', 'the step-2 tool result was matched across the close boundary');
+	assert.ok(!('n8n.tool.result_observed' in attrs), 'a matched tool span carries no unmatched marker');
+	assert.equal(spans.filter((s) => s.name.startsWith('llm:')).length, 2, 'both LLM calls present');
 });
 
 test('closeFunction is idempotent: calling it more than once never throws', async () => {

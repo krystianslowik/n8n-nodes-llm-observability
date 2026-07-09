@@ -40,6 +40,8 @@ export interface LlmResultLike {
 	llmOutput?: {
 		tokenUsage?: { promptTokens?: number; completionTokens?: number };
 		usage?: { input_tokens?: number; output_tokens?: number };
+		/** @langchain/openai Responses-API path; backend-reported there despite the name. */
+		estimatedTokenUsage?: { promptTokens?: number; completionTokens?: number };
 	};
 }
 

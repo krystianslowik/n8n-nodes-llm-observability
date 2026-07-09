@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.2 - 2026-07-09
+
+### Fixed
+
+- **One agent execution is one trace again on n8n's steppable Tools Agent
+  (V3, the current default).** n8n runs `supplyData` close hooks after every
+  agent *step*, not at execution end; previous versions evicted the
+  per-execution tracing pipeline there, splitting one run into one trace per
+  LLM call and losing the pending tool-call ledger (so no tool spans). The
+  close hook now only marks the pipeline; eviction happens lazily after a
+  linger window, so all steps of an execution share one trace.
+- **Tool calls and token usage are captured reliably.** n8n's built-in
+  tracing callback mutates the shared LangChain result before later handlers
+  run — it strips the `message` (with `tool_calls` and `usage_metadata`) from
+  generations. The exporter's handler now attaches first, ahead of the
+  mutation.
+- **Token usage on OpenAI's Responses API** (auto-selected by LangChain for
+  gpt-5-family and other current OpenAI models): usage is additionally read
+  from the `estimatedTokenUsage` output — on that path it is the
+  backend-reported count, and it was previously missed entirely.
+
 ## 0.1.1 - 2026-07-09
 
 ### Added

@@ -570,7 +570,7 @@ export class RunTreeTracker {
 	 */
 	private emitSynthesizedToolSpan(
 		pending: PendingToolCall,
-		result: { resultObserved: boolean; output?: unknown },
+		result: { resultObserved: boolean; output?: unknown; endMs?: number },
 	): void {
 		if (!this.config.singleTrace) return;
 		const context = this.sharedTraceContext();
@@ -589,7 +589,7 @@ export class RunTreeTracker {
 			name: `tool:${toolName ?? 'unknown'}`,
 			kind: SPAN_KIND_INTERNAL,
 			startTimeUnixNano: msToNanos(pending.requestedAtMs),
-			endTimeUnixNano: msToNanos(this.now()),
+			endTimeUnixNano: msToNanos(result.endMs ?? this.now()),
 			attributes: toOtlpAttributes({
 				...this.config.baseAttributes,
 				'gen_ai.operation.name': 'execute_tool',
@@ -610,19 +610,24 @@ export class RunTreeTracker {
 	}
 
 	/**
-	 * Execution-end flush — the `closeFunction` entry point wired by
-	 * `wrapModelWithTracing`. (a) Still-pending tool calls are flushed as
+	 * Execution-end flush — wired by `wrapModelWithTracing`, which invokes it
+	 * from its registry sweep once an execution has stayed closed past the
+	 * linger window (n8n's steppable Tools Agent fires `closeFunction` after
+	 * EVERY agent step, so the close itself is not proof the execution ended
+	 * — see `buildCloseFunction`). (a) Still-pending tool calls are flushed as
 	 * synthesized spans with `n8n.tool.result_observed: false` and no output:
 	 * the model requested the tool but no later model call carried its result
-	 * (typically an error mid-tool). (b) `retryPendingRoot` runs for a root
-	 * whose export batch failed after the last closeRun. Never throws.
+	 * (typically an error mid-tool). `atMs` — the time of the last observed
+	 * close — anchors their end time, since the sweep may run long after the
+	 * execution finished. (b) `retryPendingRoot` runs for a root whose export
+	 * batch failed after the last closeRun. Never throws.
 	 */
-	finalize(): void {
+	finalize(atMs?: number): void {
 		try {
 			if (this.config.singleTrace) {
 				const pending = this.pendingToolCalls.splice(0, this.pendingToolCalls.length);
 				for (const entry of pending) {
-					this.emitSynthesizedToolSpan(entry, { resultObserved: false });
+					this.emitSynthesizedToolSpan(entry, { resultObserved: false, endMs: atMs });
 				}
 			}
 		} catch {

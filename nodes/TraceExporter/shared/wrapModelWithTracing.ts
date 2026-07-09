@@ -25,10 +25,19 @@ export interface TraceExporterOptions {
 }
 
 /**
- * Append our handler to the model's existing callbacks without clobbering
+ * PREPEND our handler to the model's existing callbacks without clobbering
  * whatever n8n already attached (core ModelSelector pattern). Handles the
  * three runtime shapes of `model.callbacks`: absent, plain array, or a
  * CallbackManager-like object with `addHandler`.
+ *
+ * Order matters — measured live: n8n's own `N8nLlmTracing` handler (always
+ * first in the model's constructor callbacks) MUTATES the shared LLMResult in
+ * its `handleLLMEnd` — `output.generations` is rewritten keeping only
+ * `text`/`generationInfo`, dropping `message` (and with it `tool_calls` and
+ * `usage_metadata`). LangChain starts handlers in array order and our
+ * handlers are synchronous, so running FIRST is the only way to see the
+ * intact payload. The CallbackManager shape has no prepend API — there we
+ * accept append order (that shape has not been observed on supplied models).
  */
 export function attachHandler(model: unknown, handler: TracingHooks): boolean {
 	if (model === null || typeof model !== 'object') return false;
@@ -40,9 +49,9 @@ export function attachHandler(model: unknown, handler: TracingHooks): boolean {
 	}
 	if (Array.isArray(callbacks)) {
 		// Idempotent: if n8n ever reuses a model instance across supplyData
-		// calls, re-pushing the same handler would double every span.
+		// calls, re-adding the same handler would double every span.
 		if (callbacks.includes(handler)) return true;
-		callbacks.push(handler);
+		callbacks.unshift(handler);
 		return true;
 	}
 	const manager = callbacks as { addHandler?: (h: unknown, inherit?: boolean) => void };
@@ -117,43 +126,77 @@ function collectBaseAttributes(
  * pipelines would split one agent run into one trace per LLM call. Module
  * scope survives across those calls within the n8n process.
  *
- * Primary eviction is the `closeFunction` returned from `supplyData` (n8n
- * invokes it when the supplied data's owning execution finishes) — see the
- * `closeFunction` construction below. `MAX_PIPELINES` FIFO eviction is only
- * the safety net for pipelines whose execution never reaches `closeFunction`
- * (e.g. a crash), so long-lived instances still can't grow this without
- * bound.
+ * Eviction is deliberately LAZY. n8n runs the `closeFunction`s collected from
+ * supplyData in the `finally` of every `runNode` invocation — and the
+ * steppable Tools Agent (V3) returns an `EngineRequest` per step and is
+ * re-invoked with the tool results, so ONE agent execution is MANY runNode
+ * invocations and `closeFunction` fires after every step, not at execution
+ * end (measured live: evict-on-close split one chat execution into one trace
+ * per LLM call and orphaned the pending-tool ledger). So `closeFunction` only
+ * MARKS the entry closed (`closedAt`); a later supplyData for the same
+ * execution — the next agent step — clears the mark and keeps the same
+ * tracker/trace. Entries that stay closed past `PIPELINE_LINGER_MS` are
+ * finalized (pending tool-span flush anchored at `closedAt`, pending-root
+ * retry — see `RunTreeTracker.finalize`) and deleted by `sweepStalePipelines`,
+ * which runs on every wrap call. `MAX_PIPELINES` FIFO eviction (closed
+ * entries first) is the backstop for pipelines whose execution never reaches
+ * `closeFunction` (e.g. a crash), so long-lived instances can't grow this
+ * without bound.
  *
- * Each entry also carries the tracker's `finalize` so `closeFunction` can
- * fire the execution-end flush — synthesized spans for tool calls whose
- * results never came back, plus the pending-root retry (see
- * `RunTreeTracker.finalize`) — before deleting the entry.
+ * Accepted residuals: an entry pins its step-1 context (via the exporter's
+ * post closure) for up to the linger window after the execution really ends;
+ * and an agent step whose tool runs LONGER than the linger window while other
+ * traffic sweeps the registry gets split into a second trace.
  */
 interface PipelineEntry {
 	handler: TracingHooks;
-	finalize: () => void;
+	finalize: (atMs?: number) => void;
+	retryPendingRoot: () => void;
+	/** Set at every closeFunction, cleared when a later step reuses the entry. */
+	closedAt?: number;
 }
 
 const pipelineByExecution = new Map<string, PipelineEntry>();
 const MAX_PIPELINES = 200;
+export const PIPELINE_LINGER_MS = 10 * 60_000;
 
 /**
- * Run the execution's tracker finalize (pending tool-span flush + pending
- * root retry, if any), then evict the registry entry. Returned as
- * `SupplyData.closeFunction` from every supplyData call of the execution —
- * idempotent, n8n may call it several times.
+ * Finalize + evict every entry that has stayed closed past the linger window.
+ * Called with `Date.now()` from every `wrapModelWithTracing` call; exported
+ * (with an explicit clock) so tests can drive the window. Never throws.
+ */
+export function sweepStalePipelines(nowMs: number, skipKey?: string): void {
+	for (const [key, entry] of pipelineByExecution) {
+		if (key === skipKey) continue;
+		if (entry.closedAt === undefined || nowMs - entry.closedAt <= PIPELINE_LINGER_MS) continue;
+		try {
+			entry.finalize(entry.closedAt);
+		} catch {
+			/* never break the workflow */
+		}
+		pipelineByExecution.delete(key);
+	}
+}
+
+/**
+ * Returned as `SupplyData.closeFunction` from every supplyData call of the
+ * execution — idempotent, n8n may call it several times, and on the steppable
+ * Tools Agent it fires after EVERY agent step (see the registry doc above).
+ * It must therefore not tear anything down: it retries a pending failed root
+ * (safe at any point) and marks the entry closed for the lazy sweep. The
+ * pending-tool flush must NOT run here — mid-execution the results are still
+ * on their way back to the next step's model call.
  */
 function buildCloseFunction(registryKey: string): () => Promise<void> {
 	return async () => {
 		const entry = pipelineByExecution.get(registryKey);
-		if (entry) {
-			try {
-				entry.finalize();
-			} catch {
-				/* never break the workflow */
-			}
+		if (!entry) return;
+		try {
+			entry.retryPendingRoot();
+		} catch {
+			/* never break the workflow */
 		}
-		pipelineByExecution.delete(registryKey);
+		entry.closedAt = Date.now();
 	};
 }
 
@@ -183,8 +226,12 @@ export function wrapModelWithTracing(
 		} catch {
 			registryKey = undefined;
 		}
+		sweepStalePipelines(Date.now(), registryKey);
 		const existing = registryKey ? pipelineByExecution.get(registryKey) : undefined;
 		if (existing && registryKey) {
+			// A later agent step of the same execution: the entry stays live and
+			// the earlier closeFunction's mark is void (see the registry doc).
+			existing.closedAt = undefined;
 			if (!attachHandler(model, existing.handler)) {
 				try {
 					ctx.logger.warn(
@@ -251,15 +298,33 @@ export function wrapModelWithTracing(
 		const handler = tracker.createHandler();
 		if (registryKey) {
 			if (pipelineByExecution.size >= MAX_PIPELINES) {
-				// Accepted residual: if the evicted entry belongs to a still-LIVE
-				// execution, that pipeline loses its pending tool flush and root
-				// retry — its finalize is never reachable again.
-				const oldest = pipelineByExecution.keys().next().value;
-				if (oldest !== undefined) pipelineByExecution.delete(oldest);
+				// Prefer the oldest CLOSED entry (its execution is likely over —
+				// finalize flushes what it can). Falling back to the oldest live
+				// entry is the accepted residual: that pipeline loses its pending
+				// tool flush and root retry — its finalize is never reachable again.
+				let evictKey: string | undefined;
+				for (const [key, entry] of pipelineByExecution) {
+					if (entry.closedAt !== undefined) {
+						evictKey = key;
+						break;
+					}
+				}
+				if (evictKey !== undefined) {
+					const evicted = pipelineByExecution.get(evictKey);
+					try {
+						evicted?.finalize(evicted.closedAt);
+					} catch {
+						/* never break the workflow */
+					}
+				} else {
+					evictKey = pipelineByExecution.keys().next().value;
+				}
+				if (evictKey !== undefined) pipelineByExecution.delete(evictKey);
 			}
 			pipelineByExecution.set(registryKey, {
 				handler,
-				finalize: () => tracker.finalize(),
+				finalize: (atMs?: number) => tracker.finalize(atMs),
+				retryPendingRoot: () => tracker.retryPendingRoot(),
 			});
 		}
 		const attached = attachHandler(model, handler);
