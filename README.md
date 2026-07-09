@@ -1,24 +1,22 @@
 # n8n-nodes-observability
 
-OpenTelemetry tracing for n8n AI Agent workflows — without replacing your nodes.
+OpenTelemetry tracing for n8n AI Agent workflows.
 
-Insert the **Trace Exporter** between any Chat Model and the AI Agent, and every
-agent execution shows up in your observability backend as one trace: each LLM
-call with model, token usage, cost, latency, and (opt-in) prompts and
-completions. Works with **Comet Opik**, **Langfuse**, **Datadog**, or any
-OTLP-compatible collector — one protocol, no vendor SDKs, zero runtime
-dependencies.
+The **Trace Exporter** is a passthrough sub-node inserted between a Chat Model
+and the AI Agent. Each agent execution is exported as one OTLP/HTTP JSON trace:
+one span per LLM call (model, token usage, latency, errors; prompts and
+completions opt-in) plus reconstructed tool-call spans. Compatible backends:
+Comet Opik, Langfuse, Datadog, or any OTLP/HTTP collector. The package has no
+runtime dependencies and does not modify the model or agent nodes.
 
 ```
 [Anthropic Chat Model] ──ai_languageModel──▶ [Trace Exporter] ──ai_languageModel──▶ [AI Agent]
 ```
 
-Keep your existing provider node. Swap OpenAI for Anthropic for Ollama — the
-tracing stays. No forked Agent nodes, no provider lock-in.
-
 ## What a trace looks like
 
-One trace per agent execution (n8n execution ID), named after your Trace Name:
+One trace per agent execution (n8n execution ID), named after the Trace Name
+parameter:
 
 ```
 trace "support-agent-run"
@@ -28,9 +26,9 @@ trace "support-agent-run"
 └─ llm:claude-sonnet-4-6   791 tok   completion: "The result of **2 × 81,672 = 163,344**."
 ```
 
-Backends that understand OTel GenAI semantic conventions (Opik does natively)
-show model, provider, per-call token usage, and computed cost with no extra
-configuration.
+Spans use OTel GenAI semantic-convention attributes; backends that map them
+(e.g. Opik) derive model, provider, per-call token usage, and cost from the
+attributes directly.
 
 ## Installation
 
@@ -91,20 +89,19 @@ errors, and — only when enabled — prompts, completions, and model-side tool-
 decisions. All spans carry n8n context (`n8n.workflow.id/name`,
 `n8n.execution.id`, `n8n.node.name`) plus your session/user/metadata.
 
-**Tool calls appear as first-class synthesized spans.** Tool *executions* (the
-actual Calculator/HTTP/etc. runs between LLM calls) are not visible to a
-model-attached tracer in n8n's current architecture, so `tool:<name>` spans are
-reconstructed from what does pass through the model: the tool calls the model
-requested, matched to the results echoed back in the next model call (marked
-`n8n.span.synthesized: true`). Their timing is derived from the surrounding
-LLM-call boundaries and therefore includes n8n framework overhead, not pure
-tool runtime. A tool whose result never reaches a later model call (e.g. an
-error mid-tool) is still emitted at execution end, marked
-`n8n.tool.result_observed: false` and without output — as are id-less tool
-calls, which can't be matched to their results even when one did flow through
-a later model call. Tool input/output
-payloads are only captured with **Capture Tool I/O** enabled. True engine-level
-tool spans still depend on an n8n-core extension point.
+Tool *executions* (the actual Calculator/HTTP/etc. runs between LLM calls) are
+not visible to a model-attached tracer in n8n's current architecture.
+`tool:<name>` spans are therefore reconstructed from what does pass through
+the model: the tool calls the model requested, matched to the results echoed
+back in the next model call (marked `n8n.span.synthesized: true`). Their
+timing is derived from the surrounding LLM-call boundaries and includes n8n
+framework overhead, not pure tool runtime. A tool whose result never reaches a
+later model call (e.g. an error mid-tool) is still emitted at execution end,
+marked `n8n.tool.result_observed: false` and without output — as are id-less
+tool calls, which can't be matched to their results even when one did flow
+through a later model call. Tool input/output payloads are only captured with
+**Capture Tool I/O** enabled. Engine-level tool spans (exact timing, engine
+visibility) depend on an n8n-core extension point.
 
 ## Compatibility
 
@@ -115,8 +112,8 @@ Node.js ≥ 22.22 on self-hosted instances.
 
 ## Roadmap
 
-- Score / feedback and dataset-item operations (evaluations loop)
-- First-class tool spans; redaction patterns; per-vendor session mapping
+- Score / feedback and dataset-item operations
+- Engine-level tool spans (requires n8n-core support); redaction patterns
 - Multi-destination fan-out
 
 ## License
