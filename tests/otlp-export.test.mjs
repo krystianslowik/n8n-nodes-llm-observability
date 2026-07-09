@@ -130,6 +130,66 @@ test('SpanExporter guards body construction: garbage resourceAttributes never th
 	}
 });
 
+test('SpanExporter keeps draining after a failed batch, even with multiple queued spans', async () => {
+	const calls = [];
+	let callCount = 0;
+	const exporter = new SpanExporter(
+		{ url: 'http://x/v1/traces', headers: {} },
+		async (url, headers, body) => {
+			callCount++;
+			calls.push(body);
+			if (callCount === 1) throw new Error('first batch down');
+		},
+		{},
+	);
+	// First span triggers the failing solo batch; two more queue up behind it
+	// while that POST is in flight (add() is synchronous, the POST is not).
+	exporter.add(span('s0'));
+	exporter.add(span('s1'));
+	exporter.add(span('s2'));
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+	assert.equal(exporter.exportErrors, 1, 'only the first batch failed');
+	assert.equal(exporter.exportedSpans, 2, 's1 and s2 still made it out after the failure');
+	const drainedNames = calls
+		.slice(1)
+		.flatMap((body) => body.resourceSpans[0].scopeSpans[0].spans.map((s) => s.name));
+	assert.deepEqual(drainedNames, ['s1', 's2'], 'queued spans still get posted after a failed batch');
+});
+
+test('SpanExporter never rejects even when onError itself throws; export still counted and queue still drains', async () => {
+	let unhandled = 0;
+	const onUnhandled = () => unhandled++;
+	process.on('unhandledRejection', onUnhandled);
+	try {
+		const calls = [];
+		let callCount = 0;
+		const exporter = new SpanExporter(
+			{ url: 'http://x', headers: {} },
+			async (url, headers, body) => {
+				callCount++;
+				calls.push(body);
+				if (callCount === 1) throw new Error('backend down');
+			},
+			{},
+			() => {
+				throw new Error('onError itself is broken');
+			},
+		);
+		exporter.add(span('s0'));
+		exporter.add(span('s1'));
+		await flushMicrotasks();
+		await flushMicrotasks();
+		await flushMicrotasks();
+		assert.equal(exporter.exportErrors, 1, 'error still counted despite onError throwing');
+		assert.equal(exporter.exportedSpans, 1, 's1 still drained after the failed+throwing batch');
+		assert.equal(unhandled, 0, 'a throwing onError must never produce an unhandled rejection');
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+	}
+});
+
 test('SpanExporter bounds the queue and counts drops when posts never drain', async () => {
 	let resolvePost;
 	const gate = new Promise((resolve) => {

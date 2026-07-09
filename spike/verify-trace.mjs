@@ -42,12 +42,21 @@ for (const trace of items) {
 			`  - ${span.name} parent=${span.parent_span_id ?? 'ROOT'} usage=${JSON.stringify(span.usage ?? span.metadata?.usage ?? null)}`,
 		);
 	}
+	// Parentage (spec: "assert parentage", not just span presence) — the
+	// tracker's singleTrace design (RunTreeTracker.emitSharedRootIfNeeded)
+	// promises exactly one parentless ROOT span per trace, with every other
+	// span in the trace referencing it via parent_span_id.
+	const rootSpans = spans.filter((s) => !s.parent_span_id);
+	const nonRootSpans = spans.filter((s) => s.parent_span_id);
+	const [rootSpan] = rootSpans;
 	const checks = {
 		'has >=1 span': spans.length >= 1,
 		'has an llm span': spans.some((s) => String(s.name).startsWith('llm:')),
 		'llm span reports token usage': spans.some(
 			(s) => JSON.stringify(s).includes('input_tokens') || JSON.stringify(s).includes('prompt_tokens'),
 		),
+		'exactly one ROOT span (no parent_span_id)': rootSpans.length === 1,
+		'every other span references the ROOT span': nonRootSpans.every((s) => s.parent_span_id === rootSpan?.id),
 	};
 	for (const [label, ok] of Object.entries(checks)) console.log(`  ${ok ? 'PASS' : 'FAIL'}: ${label}`);
 }

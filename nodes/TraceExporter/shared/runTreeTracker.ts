@@ -83,8 +83,20 @@ declare const crypto: {
  * Maps LangChain runId/parentRunId callbacks onto OTLP spans (spec §"Run-tree
  * tracker"). Runs under an observed parent get real parentage; runs under an
  * unseen parent (the expected case: the agent's chain run never reaches a
- * model-attached handler) share a trace keyed on that unseen parentRunId, so
- * one agent execution stays one trace even without a root span.
+ * model-attached handler) share a trace keyed on that unseen parentRunId.
+ *
+ * With `singleTrace` (the only mode `wrapModelWithTracing` uses), every
+ * parentless/unseen-parent run in one tracker is parented under a single
+ * synthetic ROOT span, emitted once before the trace's first real span (see
+ * `emitSharedRootIfNeeded`) — one agent execution stays one trace. That root
+ * ships as its own solo export batch, the coldest request against the
+ * backend: if it fails, every child span already sent (or about to be sent)
+ * references a parentSpanId the backend never received. `notifyExportFailed`
+ * closes that gap — when the exporter reports a failed batch containing the
+ * root, the tracker re-arms emission so the next `closeRun` re-emits the
+ * SAME root spanId; children that already referenced it become valid once
+ * it lands, and a duplicate root landing twice just 409s harmlessly on the
+ * backend (Opik semantics — see `singleTrace` doc above `TrackerConfig`).
  */
 export class RunTreeTracker {
 	readonly events: TrackerEvent[] = [];
@@ -155,6 +167,13 @@ export class RunTreeTracker {
 	 * see `singleTrace` doc). Children appended in later batches may end after
 	 * this root's recorded end time; that approximation is a known spike
 	 * trade-off (no timers, no end-of-execution hook to close the root with).
+	 *
+	 * `rootEmitted` latches optimistically — set as soon as the root is handed
+	 * to the exporter, before the export outcome is known — because emission
+	 * here is decoupled from the POST. If that export batch fails,
+	 * `notifyExportFailed` resets the latch so this method re-emits the exact
+	 * same `rootSpanId` on the next call, retrying the root without orphaning
+	 * children that already reference it.
 	 */
 	private emitSharedRootIfNeeded(): void {
 		const shared = this.sharedTrace;
@@ -170,6 +189,22 @@ export class RunTreeTracker {
 			attributes: toOtlpAttributes(this.config.baseAttributes),
 			status: { code: STATUS_OK },
 		});
+	}
+
+	/**
+	 * Exporter-failure callback (wired from `wrapModelWithTracing`): if the
+	 * failed batch contained the shared trace's root span, un-latch
+	 * `rootEmitted` so the next `closeRun` re-emits it with the SAME
+	 * `rootSpanId` — see the retry-semantics note on `emitSharedRootIfNeeded`.
+	 * A no-op when there's no shared trace, the root was never emitted, or the
+	 * failed batch didn't include the root.
+	 */
+	notifyExportFailed(spans: Array<{ spanId: string }>): void {
+		const shared = this.sharedTrace;
+		if (!shared || !shared.rootEmitted) return;
+		if (spans.some((span) => span.spanId === shared.rootSpanId)) {
+			shared.rootEmitted = false;
+		}
 	}
 
 	private traceContextFor(parentRunId?: string): {

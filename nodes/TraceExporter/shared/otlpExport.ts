@@ -80,6 +80,7 @@ export class SpanExporter {
 		private readonly post: HttpPost,
 		private readonly resourceAttributes: Record<string, OtlpAttrValue>,
 		private readonly onError?: (message: string) => void,
+		private readonly onBatchFailed?: (spans: OtlpSpan[]) => void,
 	) {}
 
 	add(span: OtlpSpan): void {
@@ -109,6 +110,11 @@ export class SpanExporter {
 					this.onError?.(`OTLP export failed: ${String(error).slice(0, 300)}`);
 				} catch {
 					// onError must never take the workflow down either
+				}
+				try {
+					this.onBatchFailed?.(spans);
+				} catch {
+					// onBatchFailed must never take the workflow down either
 				}
 			})
 			.then(() => {

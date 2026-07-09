@@ -98,11 +98,23 @@ function collectBaseAttributes(
  * One tracing pipeline per (execution, node): measured live in the spike,
  * n8n's AI Agent re-calls supplyData for EVERY model invocation, so per-call
  * pipelines would split one agent run into one trace per LLM call. Module
- * scope survives across those calls within the n8n process; bounded so
- * long-lived instances can't grow it without limit.
+ * scope survives across those calls within the n8n process.
+ *
+ * Primary eviction is the `closeFunction` returned from `supplyData` (n8n
+ * invokes it when the supplied data's owning execution finishes) — see the
+ * `closeFunction` construction below. `MAX_PIPELINES` FIFO eviction is only
+ * the safety net for pipelines whose execution never reaches `closeFunction`
+ * (e.g. a crash), so long-lived instances still can't grow this without
+ * bound.
  */
 const pipelineByExecution = new Map<string, TracingHooks>();
 const MAX_PIPELINES = 200;
+
+/** Result of {@link wrapModelWithTracing} — the model plus its eviction hook. */
+export interface WrappedModel {
+	model: unknown;
+	closeFunction?: () => Promise<void>;
+}
 
 /**
  * Wraps the supplied LangChain model with the OTel tracing pipeline (spec
@@ -116,7 +128,7 @@ export function wrapModelWithTracing(
 	model: unknown,
 	options: TraceExporterOptions,
 	credential: OtlpCredential,
-): unknown {
+): WrappedModel {
 	try {
 		let registryKey: string | undefined;
 		try {
@@ -135,10 +147,24 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			}
-			return model;
+			return {
+				model,
+				closeFunction: registryKey
+					? async () => {
+							pipelineByExecution.delete(registryKey);
+						}
+					: undefined,
+			};
 		}
 
 		const target = buildExportTarget(credential);
+		// `tracker` is constructed after `exporter`, but the exporter's
+		// failure callback needs to call back into the tracker (Fix: root
+		// re-emit on export failure). Resolve the chicken/egg with a mutable
+		// box the closure reads from, filled in once the tracker exists below
+		// — a box property mutates in place, so this stays lint-clean as a
+		// `const` (unlike a plain forward-declared `let`).
+		const trackerBox: { current?: RunTreeTracker } = {};
 		const exporter = new SpanExporter(
 			target,
 			async (url, headers, body) =>
@@ -151,6 +177,7 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			},
+			(spans) => trackerBox.current?.notifyExportFailed(spans),
 		);
 		const tracker = new RunTreeTracker(
 			{
@@ -173,6 +200,7 @@ export function wrapModelWithTracing(
 			},
 			(span) => exporter.add(span),
 		);
+		trackerBox.current = tracker;
 		const handler = tracker.createHandler();
 		if (registryKey) {
 			if (pipelineByExecution.size >= MAX_PIPELINES) {
@@ -191,6 +219,14 @@ export function wrapModelWithTracing(
 				/* never break the workflow */
 			}
 		}
+		return {
+			model,
+			closeFunction: registryKey
+				? async () => {
+						pipelineByExecution.delete(registryKey);
+					}
+				: undefined,
+		};
 	} catch (error) {
 		try {
 			ctx.logger.warn(`[TraceExporter] tracing setup failed, passing model through: ${String(error)}`);
@@ -198,5 +234,5 @@ export function wrapModelWithTracing(
 			/* never break the workflow */
 		}
 	}
-	return model;
+	return { model };
 }

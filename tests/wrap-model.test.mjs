@@ -71,7 +71,8 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	const ctx = fakeCtx(httpCalls, [], 'exec-e2e');
 	const model = { callbacks: [] };
 	const returned = wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
-	assert.equal(returned, model);
+	assert.equal(returned.model, model);
+	assert.equal(typeof returned.closeFunction, 'function', 'registry-backed wrap returns a closeFunction');
 	assert.equal(model.callbacks.length, 1);
 
 	const handler = model.callbacks[0];
@@ -130,7 +131,8 @@ test('wrapModelWithTracing never throws — broken ctx still returns the model',
 	const model = { callbacks: [] };
 	const broken = {};
 	const returned = wrapModelWithTracing(broken, model, OPTIONS, CREDENTIAL);
-	assert.equal(returned, model);
+	assert.equal(returned.model, model);
+	assert.equal(returned.closeFunction, undefined, 'failure path returns no closeFunction');
 });
 
 test('one execution shares one pipeline: spans from separate wrap calls share a traceId', async () => {
@@ -174,4 +176,97 @@ test('different executions get different pipelines and traces', async () => {
 	assert.equal(spans.length, 4);
 	const traceIds = new Set(spans.map((s) => s.traceId));
 	assert.equal(traceIds.size, 2);
+});
+
+test('root re-emits with the SAME spanId after its export batch fails, so late-arriving children stay valid', async () => {
+	const httpCalls = [];
+	let callCount = 0;
+	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry');
+	// The synthetic root always ships as its own solo batch first; fail only
+	// that first POST, then let every later batch succeed.
+	ctx.helpers.httpRequest = async (options) => {
+		callCount++;
+		httpCalls.push(options);
+		if (callCount === 1) throw new Error('backend down for the root batch');
+	};
+
+	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	// A second LLM span's closeRun is what re-triggers emitSharedRootIfNeeded.
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-2');
+	handler.handleLLMEnd({}, 'run-2');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(bodies.length, 4, 'four POSTs: failed root, llm-1, re-emitted root, llm-2');
+
+	const [failedRoot] = bodies[0];
+	const [llm1] = bodies[1];
+	const [reEmittedRoot] = bodies[2];
+	const [llm2] = bodies[3];
+
+	assert.equal(failedRoot.parentSpanId, undefined, 'the root span itself has no parent');
+	assert.equal(reEmittedRoot.spanId, failedRoot.spanId, 'retry re-emits the SAME root spanId');
+	assert.equal(reEmittedRoot.traceId, failedRoot.traceId);
+	assert.equal(llm1.parentSpanId, reEmittedRoot.spanId, 'llm-1 already referenced the (retried) root spanId');
+	assert.equal(llm2.parentSpanId, reEmittedRoot.spanId, 'llm-2 parented to the same root spanId');
+	// Final state: the backend actually received the root (batch 3 succeeded)
+	// with the exact spanId both children point to as their parent.
+});
+
+test("closeFunction evicts the execution's pipeline: a later wrap call gets a FRESH handler", async () => {
+	const httpCalls = [];
+	const modelA = { callbacks: [] };
+	const { closeFunction } = wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelA, OPTIONS, CREDENTIAL);
+	assert.equal(typeof closeFunction, 'function');
+	const handlerA = modelA.callbacks[0];
+
+	await closeFunction();
+
+	const modelB = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelB, OPTIONS, CREDENTIAL);
+	const handlerB = modelB.callbacks[0];
+
+	assert.notEqual(handlerB, handlerA, 'evicted execution gets a brand-new handler, not the stale one');
+});
+
+test('closeFunction is idempotent: calling it more than once never throws', async () => {
+	const model = { callbacks: [] };
+	const { closeFunction } = wrapModelWithTracing(fakeCtx([], [], 'exec-close-2'), model, OPTIONS, CREDENTIAL);
+	await closeFunction();
+	await assert.doesNotReject(closeFunction());
+});
+
+test('MAX_PIPELINES FIFO eviction is the backstop: re-wrapping the first of 201 executions gets a NEW handler', () => {
+	const httpCalls = [];
+	const firstExecId = 'exec-evict-0';
+	const firstModel = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], firstExecId), firstModel, OPTIONS, CREDENTIAL);
+	const firstHandler = firstModel.callbacks[0];
+
+	// MAX_PIPELINES is 200; 200 more distinct executions push the registry
+	// past capacity and evict the oldest entry (the one above).
+	for (let i = 1; i <= 200; i++) {
+		const model = { callbacks: [] };
+		wrapModelWithTracing(fakeCtx(httpCalls, [], `exec-evict-${i}`), model, OPTIONS, CREDENTIAL);
+	}
+
+	const rewrappedModel = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], firstExecId), rewrappedModel, OPTIONS, CREDENTIAL);
+	const rewrappedHandler = rewrappedModel.callbacks[0];
+
+	assert.notEqual(
+		rewrappedHandler,
+		firstHandler,
+		'the first execution was FIFO-evicted once MAX_PIPELINES was exceeded',
+	);
 });

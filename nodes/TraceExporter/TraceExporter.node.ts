@@ -193,8 +193,13 @@ export class TraceExporter implements INodeType {
 			itemIndex,
 		)) as unknown as OtlpCredential;
 
-		return {
-			response: wrapModelWithTracing(this, model, traceExporterOptions, credential),
-		};
+		const { model: wrappedModel, closeFunction } = wrapModelWithTracing(
+			this,
+			model,
+			traceExporterOptions,
+			credential,
+		);
+
+		return closeFunction ? { response: wrappedModel, closeFunction } : { response: wrappedModel };
 	}
 }
