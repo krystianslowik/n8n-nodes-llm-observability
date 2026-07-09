@@ -48,6 +48,13 @@ test('attachHandler appends to an existing callbacks array without clobbering', 
 	assert.equal(model.callbacks[0], existing);
 });
 
+test('attachHandler is idempotent for arrays: re-attaching the same handler does not double it', () => {
+	const handler = { name: 'mine' };
+	const model = { callbacks: [handler] };
+	assert.equal(attachHandler(model, handler), true);
+	assert.equal(model.callbacks.length, 1, 'the same handler is never pushed twice');
+});
+
 test('attachHandler creates the array when callbacks is undefined', () => {
 	const model = {};
 	assert.equal(attachHandler(model, { name: 'mine' }), true);
@@ -100,7 +107,41 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
 	assert.equal(attrs['session.id'], 'sess-1');
 	assert.equal(attrs['user.id'], 'user-1');
+	// Backend-native grouping keys fan out from Session ID / User ID:
+	// Opik Threads (thread_id + semconv, verified in spike/verify-thread-mapping.mjs)
+	// and Langfuse sessions/users (langfuse.* per their OTel docs).
+	assert.equal(attrs['gen_ai.conversation.id'], 'sess-1');
+	assert.equal(attrs['thread_id'], 'sess-1');
+	assert.equal(attrs['langfuse.session.id'], 'sess-1');
+	assert.equal(attrs['langfuse.user.id'], 'user-1');
 	assert.equal(attrs['gen_ai.request.model'], 'gpt-4o-mini');
+});
+
+test('empty Session ID / User ID emit NO session, thread, or user attributes', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-no-session');
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, { ...OPTIONS, sessionId: '', userId: '' }, CREDENTIAL);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	const allSpans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.ok(allSpans.length >= 1);
+	for (const span of allSpans) {
+		const keys = span.attributes.map((a) => a.key);
+		for (const absent of [
+			'session.id',
+			'gen_ai.conversation.id',
+			'thread_id',
+			'langfuse.session.id',
+			'user.id',
+			'langfuse.user.id',
+		]) {
+			assert.ok(!keys.includes(absent), `${absent} must be absent when unset (span ${span.name})`);
+		}
+	}
 });
 
 test('export failure is swallowed: no unhandled rejection, warning logged', async () => {
@@ -221,6 +262,70 @@ test('root re-emits with the SAME spanId after its export batch fails, so late-a
 	assert.equal(llm2.parentSpanId, reEmittedRoot.spanId, 'llm-2 parented to the same root spanId');
 	// Final state: the backend actually received the root (batch 3 succeeded)
 	// with the exact spanId both children point to as their parent.
+});
+
+test('a 409 on the root batch does NOT re-emit: the backend already has the root', async () => {
+	const httpCalls = [];
+	let callCount = 0;
+	const ctx = fakeCtx(httpCalls, [], 'exec-root-409');
+	// The solo root batch "fails" with a 409 — Opik answering "Trace already
+	// exists", e.g. after a client-side timeout on a POST the server ingested.
+	ctx.helpers.httpRequest = async (options) => {
+		callCount++;
+		httpCalls.push(options);
+		if (callCount === 1) {
+			// n8n NodeApiError shape: httpCode is a string
+			throw Object.assign(new Error('Conflict'), { httpCode: '409' });
+		}
+	};
+
+	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-2');
+	handler.handleLLMEnd({}, 'run-2');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(bodies.length, 3, 'three POSTs: 409ed root, llm-1, llm-2 — NO re-emitted root batch');
+	const rootSpanId = bodies[0][0].spanId;
+	const laterSpanIds = bodies.slice(1).flat().map((s) => s.spanId);
+	assert.ok(!laterSpanIds.includes(rootSpanId), 'no later batch carries a re-emitted root');
+});
+
+test('non-numeric Max Payload Size falls back to the 32 KB default budget instead of truncating everything', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-nan-budget');
+	const model = { callbacks: [] };
+	wrapModelWithTracing(
+		ctx,
+		model,
+		{ ...OPTIONS, capturePrompts: true, maxPayloadSizeKb: 'lots' },
+		CREDENTIAL,
+	);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['x', 'openai', 'ChatOpenAI'] },
+		[[{ content: 'short prompt', _getType: () => 'human' }]],
+		'run-1',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: 'short answer' }]] }, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	const llm = spans.find((s) => s.name.startsWith('llm:'));
+	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
+	assert.ok(String(attrs['gen_ai.prompt']).includes('short prompt'), 'prompt captured under the default budget');
+	assert.ok(!String(attrs['gen_ai.prompt']).includes('[truncated]'), 'a NaN budget must not truncate everything');
+	assert.equal(attrs['gen_ai.completion'], 'short answer', 'completion untouched too');
 });
 
 test('single-closeRun execution: closeFunction retries the failed root at execution end (and still evicts)', async () => {

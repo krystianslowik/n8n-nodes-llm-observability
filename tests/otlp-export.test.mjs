@@ -190,6 +190,34 @@ test('SpanExporter never rejects even when onError itself throws; export still c
 	}
 });
 
+test('onBatchFailed receives the failed spans plus the HTTP status extracted from n8n error shapes', async () => {
+	const shapes = [
+		// n8n NodeApiError exposes httpCode as a STRING
+		[Object.assign(new Error('conflict'), { httpCode: '409' }), 409],
+		[Object.assign(new Error('conflict'), { statusCode: 409 }), 409],
+		[Object.assign(new Error('conflict'), { response: { status: 409 } }), 409],
+		// axios-style nesting under cause
+		[Object.assign(new Error('conflict'), { cause: { response: { status: 409 } } }), 409],
+		[new Error('no status anywhere'), undefined],
+	];
+	for (const [error, expected] of shapes) {
+		const received = [];
+		const exporter = new SpanExporter(
+			{ url: 'http://x', headers: {} },
+			async () => {
+				throw error;
+			},
+			{},
+			undefined,
+			(spans, statusCode) => received.push([spans.length, statusCode]),
+		);
+		exporter.add(span());
+		await flushMicrotasks();
+		await flushMicrotasks();
+		assert.deepEqual(received, [[1, expected]], `error shape: ${JSON.stringify(error)}`);
+	}
+});
+
 test('SpanExporter bounds the queue and counts drops when posts never drain', async () => {
 	let resolvePost;
 	const gate = new Promise((resolve) => {

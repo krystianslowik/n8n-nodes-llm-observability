@@ -56,6 +56,32 @@ export type HttpPost = (
 ) => Promise<unknown>;
 
 /**
+ * Best-effort HTTP status from a rejected POST. n8n's `httpRequest` error
+ * shape varies by version/transport — `httpCode` (a string on NodeApiError),
+ * `statusCode`, `response.status`, or an axios-style `cause.response.status`
+ * — so probe them all defensively; undefined when none yields a number.
+ */
+function statusCodeFrom(error: unknown): number | undefined {
+	try {
+		if (error === null || typeof error !== 'object') return undefined;
+		const e = error as {
+			httpCode?: unknown;
+			statusCode?: unknown;
+			response?: { status?: unknown } | null;
+			cause?: { response?: { status?: unknown } | null } | null;
+		};
+		const candidates = [e.httpCode, e.statusCode, e.response?.status, e.cause?.response?.status];
+		for (const candidate of candidates) {
+			const parsed = typeof candidate === 'string' ? Number(candidate) : candidate;
+			if (typeof parsed === 'number' && Number.isFinite(parsed)) return parsed;
+		}
+	} catch {
+		// hostile error object — status stays unknown
+	}
+	return undefined;
+}
+
+/**
  * Fire-and-forget OTLP shipper (spec §"Hand-rolled OTLP/JSON exporter").
  * No timers (scanner bans setTimeout): every completed span triggers a flush.
  * The POST promise is detached and `.catch`-guarded — a slow or down backend
@@ -80,7 +106,7 @@ export class SpanExporter {
 		private readonly post: HttpPost,
 		private readonly resourceAttributes: Record<string, OtlpAttrValue>,
 		private readonly onError?: (message: string) => void,
-		private readonly onBatchFailed?: (spans: OtlpSpan[]) => void,
+		private readonly onBatchFailed?: (spans: OtlpSpan[], statusCode?: number) => void,
 	) {}
 
 	add(span: OtlpSpan): void {
@@ -112,7 +138,7 @@ export class SpanExporter {
 					// onError must never take the workflow down either
 				}
 				try {
-					this.onBatchFailed?.(spans);
+					this.onBatchFailed?.(spans, statusCodeFrom(error));
 				} catch {
 					// onBatchFailed must never take the workflow down either
 				}

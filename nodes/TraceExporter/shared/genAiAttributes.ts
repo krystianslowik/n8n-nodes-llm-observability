@@ -56,13 +56,42 @@ export function completionTextFrom(output: LlmResultLike): string | undefined {
 }
 
 /**
+ * Sanity cap on extracted tool calls per LLM result, applied by slicing the
+ * source array BEFORE mapping so a giant malformed `tool_calls` payload never
+ * even allocates a giant mapped copy. Matches the tracker's pending-ledger
+ * bound (MAX_PENDING_TOOL_CALLS).
+ */
+const MAX_TOOL_CALLS = 100;
+
+/**
  * Tool calls the model decided to make, from LangChain's provider-normalized
  * `message.tool_calls`. Tool *executions* never reach a model-attached
  * callback handler (measured live in the spike) — this is the model-side view
  * of tool activity, which is the best a passthrough sub-node can observe.
  */
-export function toolCallsFrom(output: LlmResultLike): Array<{ name?: string; args?: unknown }> {
-	const calls = output.generations?.[0]?.[0]?.message?.tool_calls;
-	if (!Array.isArray(calls)) return [];
-	return calls.map((call) => ({ name: call?.name, args: call?.args }));
+export function toolCallsFrom(
+	output: LlmResultLike,
+): Array<{ id?: string; name?: string; args?: unknown }> {
+	const message = output.generations?.[0]?.[0]?.message;
+	const normalized = message?.tool_calls;
+	if (Array.isArray(normalized) && normalized.length > 0) {
+		return normalized
+			.slice(0, MAX_TOOL_CALLS)
+			.map((call) => ({ id: call?.id, name: call?.name, args: call?.args }));
+	}
+	// Fallback: raw OpenAI shape in additional_kwargs — `arguments` is a JSON
+	// string; parse best-effort, keep the raw string when parsing fails.
+	const raw = message?.additional_kwargs?.tool_calls;
+	if (!Array.isArray(raw)) return [];
+	return raw.slice(0, MAX_TOOL_CALLS).map((call) => {
+		let args: unknown = call?.function?.arguments;
+		if (typeof args === 'string') {
+			try {
+				args = JSON.parse(args);
+			} catch {
+				/* keep the unparsed string */
+			}
+		}
+		return { id: call?.id, name: call?.function?.name, args };
+	});
 }

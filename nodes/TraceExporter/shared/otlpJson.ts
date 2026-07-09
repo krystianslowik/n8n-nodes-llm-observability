@@ -20,12 +20,12 @@ export interface OtlpSpan {
 	startTimeUnixNano: string;
 	endTimeUnixNano: string;
 	attributes: OtlpKeyValue[];
-	status: { code: number; message?: string };
+	/** OTel convention: omitted (UNSET) on success; ERROR only on failure. */
+	status?: { code: number; message?: string };
 }
 
 export const SPAN_KIND_INTERNAL = 1;
 export const SPAN_KIND_CLIENT = 3;
-export const STATUS_OK = 1;
 export const STATUS_ERROR = 2;
 
 /**

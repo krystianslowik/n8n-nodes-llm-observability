@@ -136,8 +136,12 @@ export class OtlpExporterApi implements ICredentialType {
 			);
 			headers.Authorization = `Basic ${token}`;
 		} else if (authType === 'apiKeyHeader') {
-			const headerName = (credentials.headerName as string) || 'Authorization';
-			headers[headerName] = credentials.apiKey as string;
+			// Empty API key means "no auth header", not an empty header value —
+			// mirrors `buildExportTarget` (nodes/TraceExporter/shared/otlpExport.ts).
+			if (credentials.apiKey) {
+				const headerName = (credentials.headerName as string) || 'Authorization';
+				headers[headerName] = credentials.apiKey as string;
+			}
 		} else if (authType === 'customHeaders') {
 			let customHeaders: Record<string, string> = {};
 			const rawCustomHeaders = credentials.customHeaders;
@@ -160,22 +164,21 @@ export class OtlpExporterApi implements ICredentialType {
 	};
 
 	/**
-	 * TODO: OTLP/HTTP intake endpoints (Langfuse `/api/public/otel`, Opik's and
-	 * Datadog's OTLP intake, generic OTel Collector `/v1/traces`) generally do
-	 * NOT expose a lightweight GET health-check route the way a REST API would
-	 * — they only accept POSTed OTLP payloads (protobuf or JSON) and often
-	 * reject anything else with a 405/415 rather than a clean 200. A "real"
-	 * test here would need to POST an empty/minimal valid OTLP
-	 * ExportTraceServiceRequest and treat any non-5xx response as success,
-	 * which isn't safe to do from a credential test without the actual OTLP
-	 * export implementation (blocked on PRD open question O1). Left as a
-	 * conservative stub (GET the bare endpoint) so the "Test" button exists
-	 * without generating misleading vendor telemetry.
+	 * OTLP/HTTP intake endpoints only accept POSTed OTLP payloads — a GET
+	 * would 404/405 on every backend. POST an empty (valid) OTLP
+	 * ExportTraceServiceRequest instead: `{"resourceSpans":[]}` is a no-op
+	 * for the backend (no spans, no vendor telemetry) but exercises the URL
+	 * and the auth headers `authenticate` attaches, so a reachable backend
+	 * answers 2xx. The URL expression mirrors `buildExportTarget`
+	 * (nodes/TraceExporter/shared/otlpExport.ts): strip trailing slashes,
+	 * append `/v1/traces` exactly once.
 	 */
 	test: ICredentialTestRequest = {
 		request: {
-			method: 'GET',
-			url: '={{$credentials.endpointUrl}}',
+			method: 'POST',
+			url: '={{ $credentials.endpointUrl.replace(/\\/+$/, "").endsWith("/v1/traces") ? $credentials.endpointUrl.replace(/\\/+$/, "") : $credentials.endpointUrl.replace(/\\/+$/, "") + "/v1/traces" }}',
+			body: { resourceSpans: [] },
+			json: true,
 		},
 	};
 }

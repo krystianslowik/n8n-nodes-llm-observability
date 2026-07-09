@@ -24,6 +24,7 @@ One trace per agent execution (n8n execution ID), named after your Trace Name:
 trace "support-agent-run"
 ├─ support-agent-run                 (root)
 ├─ llm:claude-sonnet-4-6   683 tok   prompt: [{"role":"human","content":"…"}]
+├─ tool:calculator                   input: "2 × 81672"  output: "163344"
 └─ llm:claude-sonnet-4-6   791 tok   completion: "The result of **2 × 81,672 = 163,344**."
 ```
 
@@ -52,13 +53,22 @@ your observability backend.
 | Datadog | `https://otlp-http-intake.logs.<site>/v1/traces` | API Key Header — header `DD-API-KEY` |
 | Any OTel collector | your collector's OTLP/HTTP base | as configured |
 
-> The credential's **Test** button GETs the endpoint, and OTLP endpoints only
-> accept POSTed span payloads — most backends answer 404 to the test. A failed
-> test does **not** mean your credential is wrong; save it and run a workflow.
+> The credential's **Test** button POSTs an empty OTLP payload
+> (`{"resourceSpans":[]}`) to `<endpoint>/v1/traces` — the same URL the
+> exporter uses — so a reachable backend with valid auth answers 2xx and the
+> test passes. No spans are ingested by the test.
 
 3. Optionally set **Trace Name** (names the trace in your backend),
    **Session ID** and **User ID** (expression-friendly — e.g. reference a chat
    session), and **Custom Metadata**.
+
+**Session/thread grouping:** Session ID is exported under the keys each
+backend natively groups on — `thread_id` and `gen_ai.conversation.id` (Opik
+picks up either as the trace's thread, so executions sharing a Session ID
+appear as one conversation under Opik's *Threads*), and `session.id` /
+`langfuse.session.id` (Langfuse *Sessions*). User ID is likewise exported as
+`user.id` and `langfuse.user.id` (Langfuse *Users*). Set Session ID to a chat
+session key (e.g. `{{ $json.sessionId }}`) to get per-conversation grouping.
 
 ## Options
 
@@ -81,12 +91,20 @@ errors, and — only when enabled — prompts, completions, and model-side tool-
 decisions. All spans carry n8n context (`n8n.workflow.id/name`,
 `n8n.execution.id`, `n8n.node.name`) plus your session/user/metadata.
 
-**Current scope is LLM-call observability.** Tool *executions* (the actual
-Calculator/HTTP/etc. runs between LLM calls) are not visible to a model-attached
-tracer in n8n's current architecture, so they don't appear as first-class spans
-yet. With prompt capture enabled, tool activity is readable in the conversation
-history of subsequent LLM calls. First-class agent/tool spans are on the
-roadmap and depend on an n8n-core extension point.
+**Tool calls appear as first-class synthesized spans.** Tool *executions* (the
+actual Calculator/HTTP/etc. runs between LLM calls) are not visible to a
+model-attached tracer in n8n's current architecture, so `tool:<name>` spans are
+reconstructed from what does pass through the model: the tool calls the model
+requested, matched to the results echoed back in the next model call (marked
+`n8n.span.synthesized: true`). Their timing is derived from the surrounding
+LLM-call boundaries and therefore includes n8n framework overhead, not pure
+tool runtime. A tool whose result never reaches a later model call (e.g. an
+error mid-tool) is still emitted at execution end, marked
+`n8n.tool.result_observed: false` and without output — as are id-less tool
+calls, which can't be matched to their results even when one did flow through
+a later model call. Tool input/output
+payloads are only captured with **Capture Tool I/O** enabled. True engine-level
+tool spans still depend on an n8n-core extension point.
 
 ## Compatibility
 

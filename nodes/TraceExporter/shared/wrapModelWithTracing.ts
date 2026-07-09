@@ -39,6 +39,9 @@ export function attachHandler(model: unknown, handler: TracingHooks): boolean {
 		return true;
 	}
 	if (Array.isArray(callbacks)) {
+		// Idempotent: if n8n ever reuses a model instance across supplyData
+		// calls, re-pushing the same handler would double every span.
+		if (callbacks.includes(handler)) return true;
 		callbacks.push(handler);
 		return true;
 	}
@@ -73,8 +76,22 @@ function collectBaseAttributes(
 		/* never break the workflow */
 	}
 	if (options.traceName) attributes['n8n.trace.name'] = options.traceName;
-	if (options.sessionId) attributes['session.id'] = options.sessionId;
-	if (options.userId) attributes['user.id'] = options.userId;
+	if (options.sessionId) {
+		// Langfuse maps this generic key to its Session (docs/opentelemetry/get-started).
+		attributes['session.id'] = options.sessionId;
+		// OTel GenAI semconv conversation key; Opik maps it to trace thread_id (verified, spike/verify-thread-mapping.mjs).
+		attributes['gen_ai.conversation.id'] = options.sessionId;
+		// Opik's documented Threads key (comet-ml/opik#3578); covers Opik versions without the semconv mapping.
+		attributes['thread_id'] = options.sessionId;
+		// Langfuse-namespaced session key; takes precedence over `session.id` per Langfuse OTel docs.
+		attributes['langfuse.session.id'] = options.sessionId;
+	}
+	if (options.userId) {
+		// Langfuse maps this generic key to its User (docs/opentelemetry/get-started).
+		attributes['user.id'] = options.userId;
+		// Langfuse-namespaced user key; takes precedence over `user.id` per Langfuse OTel docs.
+		attributes['langfuse.user.id'] = options.userId;
+	}
 
 	let metadata = options.metadata;
 	if (typeof metadata === 'string') {
@@ -107,29 +124,31 @@ function collectBaseAttributes(
  * (e.g. a crash), so long-lived instances still can't grow this without
  * bound.
  *
- * Each entry also carries the tracker's `retryPendingRoot` so `closeFunction`
- * can fire the execution-end root retry (see `RunTreeTracker.retryPendingRoot`)
- * before deleting the entry.
+ * Each entry also carries the tracker's `finalize` so `closeFunction` can
+ * fire the execution-end flush — synthesized spans for tool calls whose
+ * results never came back, plus the pending-root retry (see
+ * `RunTreeTracker.finalize`) — before deleting the entry.
  */
 interface PipelineEntry {
 	handler: TracingHooks;
-	retryPendingRoot: () => void;
+	finalize: () => void;
 }
 
 const pipelineByExecution = new Map<string, PipelineEntry>();
 const MAX_PIPELINES = 200;
 
 /**
- * Retry the execution's pending root (if any), then evict the registry entry.
- * Returned as `SupplyData.closeFunction` from every supplyData call of the
- * execution — idempotent, n8n may call it several times.
+ * Run the execution's tracker finalize (pending tool-span flush + pending
+ * root retry, if any), then evict the registry entry. Returned as
+ * `SupplyData.closeFunction` from every supplyData call of the execution —
+ * idempotent, n8n may call it several times.
  */
 function buildCloseFunction(registryKey: string): () => Promise<void> {
 	return async () => {
 		const entry = pipelineByExecution.get(registryKey);
 		if (entry) {
 			try {
-				entry.retryPendingRoot();
+				entry.finalize();
 			} catch {
 				/* never break the workflow */
 			}
@@ -188,8 +207,11 @@ export function wrapModelWithTracing(
 		const trackerBox: { current?: RunTreeTracker } = {};
 		const exporter = new SpanExporter(
 			target,
+			// `timeout` bounds each export POST: the exporter allows one batch
+			// in flight at a time, so a hung backend would otherwise pin that
+			// slot (and grow the bounded queue into drops) forever.
 			async (url, headers, body) =>
-				ctx.helpers.httpRequest({ method: 'POST', url, headers, body, json: true }),
+				ctx.helpers.httpRequest({ method: 'POST', url, headers, body, json: true, timeout: 10000 }),
 			{ 'service.name': 'n8n-trace-exporter' },
 			(message) => {
 				try {
@@ -198,13 +220,17 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			},
-			(spans) => trackerBox.current?.notifyExportFailed(spans),
+			(spans, statusCode) => trackerBox.current?.notifyExportFailed(spans, statusCode),
 		);
 		const tracker = new RunTreeTracker(
 			{
 				capturePrompts: options.capturePrompts,
 				captureToolIO: options.captureToolIO,
-				maxPayloadBytes: Math.max(1, options.maxPayloadSizeKb) * 1024,
+				// A non-numeric node option would make the budget NaN — every
+				// byte comparison then fails and EVERYTHING truncates to the bare
+				// marker. Fall back to the option's 32 KB default instead.
+				maxPayloadBytes:
+					(Number.isFinite(options.maxPayloadSizeKb) ? Math.max(1, options.maxPayloadSizeKb) : 32) * 1024,
 				samplingRatePercent: options.samplingRatePercent,
 				singleTrace: true,
 				rootSpanName: options.traceName || 'n8n agent execution',
@@ -225,12 +251,15 @@ export function wrapModelWithTracing(
 		const handler = tracker.createHandler();
 		if (registryKey) {
 			if (pipelineByExecution.size >= MAX_PIPELINES) {
+				// Accepted residual: if the evicted entry belongs to a still-LIVE
+				// execution, that pipeline loses its pending tool flush and root
+				// retry — its finalize is never reachable again.
 				const oldest = pipelineByExecution.keys().next().value;
 				if (oldest !== undefined) pipelineByExecution.delete(oldest);
 			}
 			pipelineByExecution.set(registryKey, {
 				handler,
-				retryPendingRoot: () => tracker.retryPendingRoot(),
+				finalize: () => tracker.finalize(),
 			});
 		}
 		const attached = attachHandler(model, handler);

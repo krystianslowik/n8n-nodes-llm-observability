@@ -63,8 +63,12 @@ export class TraceExporter implements INodeType {
 		// See the class-level comment above (PRD §7): `AiLanguageModel`
 		// is a valid runtime `NodeConnectionType`, but community-node public
 		// typings for `inputs`/`outputs` don't yet officially include it, so we
-		// cast just these two fields.
-		inputs: [NodeConnectionTypes.AiLanguageModel] as INodeTypeDescription['inputs'],
+		// cast just these two fields. `maxConnections: 1` — this node wraps
+		// exactly one model; a bare-string entry would allow unlimited
+		// connections (and make getInputConnectionData return an array).
+		inputs: [
+			{ type: NodeConnectionTypes.AiLanguageModel, maxConnections: 1 },
+		] as INodeTypeDescription['inputs'],
 		outputs: [NodeConnectionTypes.AiLanguageModel] as INodeTypeDescription['outputs'],
 		credentials: [
 			{
@@ -161,10 +165,11 @@ export class TraceExporter implements INodeType {
 	};
 
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
-		// Bare-string `inputs` entries allow unlimited connections, so
-		// getInputConnectionData returns an ARRAY of supplied models here —
-		// verified live in the spike (attaching to the array traces nothing).
-		// Unwrap to the first (and in practice only) connected model.
+		// With `maxConnections: 1` on the input, getInputConnectionData returns
+		// the single supplied model directly. The array-unwrap below is a
+		// defensive fallback for older n8n versions that still hand back an
+		// ARRAY (measured live in the spike: attaching to the array traces
+		// nothing).
 		const supplied = await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, itemIndex);
 		const model = Array.isArray(supplied) ? (supplied[0] as unknown) : supplied;
 

@@ -10,7 +10,6 @@ import {
 	msToNanos,
 	toOtlpAttributes,
 	SPAN_KIND_CLIENT,
-	STATUS_OK,
 } from '../dist/nodes/TraceExporter/shared/otlpJson.js';
 import { apiBaseFrom, opikHeaders, otlpTracesUrl, projectName } from './opik.mjs';
 
@@ -36,7 +35,7 @@ const body = buildExportRequest({ 'service.name': 'n8n-otel-spike' }, [
 			'gen_ai.usage.input_tokens': 21,
 			'gen_ai.usage.output_tokens': 7,
 		}),
-		status: { code: STATUS_OK },
+		// OTel convention: status omitted (UNSET) on success
 	},
 ]);
 

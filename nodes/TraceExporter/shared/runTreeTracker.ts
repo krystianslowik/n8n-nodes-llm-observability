@@ -19,7 +19,6 @@ import {
 	SPAN_KIND_CLIENT,
 	SPAN_KIND_INTERNAL,
 	STATUS_ERROR,
-	STATUS_OK,
 } from './otlpJson';
 import type { OtlpAttrValue, OtlpSpan } from './otlpJson';
 
@@ -58,6 +57,29 @@ export interface TrackerConfig {
 	rootSpanName?: string;
 }
 
+/** Tool call the model requested, awaiting its result in a later model call. */
+interface PendingToolCall {
+	id?: string;
+	name?: string;
+	args?: unknown;
+	requestedAtMs: number;
+}
+
+/**
+ * Runaway backstop for the pending-tool-call ledger: entries only leave when
+ * a matching tool result arrives or `finalize` flushes, so a pathological
+ * agent loop (or a mode where synthesis never drains) must not grow it
+ * unbounded. Drop-oldest.
+ */
+const MAX_PENDING_TOOL_CALLS = 100;
+
+/**
+ * Root re-emission bound: the initial emit plus at most this many re-emits
+ * per execution. `notifyExportFailed` stops un-latching once the bound is
+ * reached, so a persistently failing root can't poison every later batch.
+ */
+const MAX_ROOT_RE_EMITS = 2;
+
 interface OpenRun {
 	spanId: string;
 	traceId: string;
@@ -80,6 +102,19 @@ declare const crypto: {
 };
 
 /**
+ * Same workaround as `crypto` above: `TextEncoder` is a Node (and web)
+ * global with no ambient type under this tsconfig — declare the narrow
+ * shape we use, module-locally, under the same lint constraints.
+ */
+declare const TextEncoder: new () => {
+	encode(input: string): Uint8Array;
+};
+
+/** Appended to byte-truncated payloads; its UTF-8 length is reserved inside the budget. */
+const TRUNCATION_MARKER = '…[truncated]';
+const TRUNCATION_MARKER_BYTES = new TextEncoder().encode(TRUNCATION_MARKER).length;
+
+/**
  * Maps LangChain runId/parentRunId callbacks onto OTLP spans (spec §"Run-tree
  * tracker"). Runs under an observed parent get real parentage; runs under an
  * unseen parent (the expected case: the agent's chain run never reaches a
@@ -95,8 +130,11 @@ declare const crypto: {
  * closes that gap — when the exporter reports a failed batch containing the
  * root, the tracker re-arms emission so the next `closeRun` re-emits the
  * SAME root spanId; children that already referenced it become valid once
- * it lands, and a duplicate root landing twice just 409s harmlessly on the
- * backend (Opik semantics — see `singleTrace` doc above `TrackerConfig`).
+ * it lands. A 409 failure re-latches instead of re-arming — it proves the
+ * backend already ingested the root (Opik answers 409 for a second
+ * parentless span on a known traceId — see `singleTrace` doc above
+ * `TrackerConfig`) — and re-emission is bounded at `MAX_ROOT_RE_EMITS` per
+ * execution.
  */
 export class RunTreeTracker {
 	readonly events: TrackerEvent[] = [];
@@ -107,6 +145,8 @@ export class RunTreeTracker {
 
 	private readonly traceForUnseenParent = new Map<string, { traceId: string; sampled: boolean }>();
 
+	private readonly pendingToolCalls: PendingToolCall[] = [];
+
 	private readonly sampledByTraceId = new Map<string, boolean>();
 
 	private sharedTrace?: {
@@ -115,6 +155,8 @@ export class RunTreeTracker {
 		rootEmitted: boolean;
 		/** True once the root has been handed to the exporter at least once. */
 		rootAttempted: boolean;
+		/** Un-latches granted so far; capped at MAX_ROOT_RE_EMITS. */
+		rootReEmits: number;
 		sampled: boolean;
 	};
 
@@ -157,6 +199,7 @@ export class RunTreeTracker {
 				rootSpanId: generateSpanId(),
 				rootEmitted: false,
 				rootAttempted: false,
+				rootReEmits: 0,
 				sampled: this.decideSampled(),
 			};
 			this.sampledByTraceId.set(this.sharedTrace.traceId, this.sharedTrace.sampled);
@@ -178,10 +221,12 @@ export class RunTreeTracker {
 	 * same `rootSpanId` on the next call, retrying the root without orphaning
 	 * children that already reference it. The next call normally comes from a
 	 * later `closeRun`; when there is none (single LLM call, no tools),
-	 * `retryPendingRoot` — invoked from the node's `closeFunction` at
-	 * execution end — is the last chance. Accepted residual: if that
-	 * execution-end retry POST also fails, there is no further retry (one
-	 * extra attempt, not a retry loop) and the trace is lost.
+	 * `retryPendingRoot` — invoked via `finalize` from the node's
+	 * `closeFunction` at execution end — is the last chance. Re-emission is
+	 * bounded: at most `MAX_ROOT_RE_EMITS` re-emits per execution
+	 * (`notifyExportFailed` stops un-latching past that), and a 409 failure
+	 * re-latches instead of retrying. Accepted residual: if every bounded
+	 * attempt fails, the trace is lost.
 	 */
 	private emitSharedRootIfNeeded(): void {
 		const shared = this.sharedTrace;
@@ -196,7 +241,6 @@ export class RunTreeTracker {
 			startTimeUnixNano: msToNanos(this.startedAtMs),
 			endTimeUnixNano: msToNanos(this.now()),
 			attributes: toOtlpAttributes(this.config.baseAttributes),
-			status: { code: STATUS_OK },
 		});
 	}
 
@@ -205,25 +249,32 @@ export class RunTreeTracker {
 	 * failed batch contained the shared trace's root span, un-latch
 	 * `rootEmitted` so the next `closeRun` re-emits it with the SAME
 	 * `rootSpanId` — see the retry-semantics note on `emitSharedRootIfNeeded`.
-	 * A no-op when there's no shared trace, the root was never emitted, or the
-	 * failed batch didn't include the root.
+	 * Two exceptions keep one bad root POST from poisoning the rest of the
+	 * execution: a 409 re-latches (the backend already has the trace root —
+	 * e.g. a client-side timeout after server ingest — so re-emitting would
+	 * 409 every later batch carrying the root), and un-latching stops after
+	 * `MAX_ROOT_RE_EMITS` re-emits. A no-op when there's no shared trace, the
+	 * root was never emitted, or the failed batch didn't include the root.
 	 */
-	notifyExportFailed(spans: Array<{ spanId: string }>): void {
+	notifyExportFailed(spans: Array<{ spanId: string }>, statusCode?: number): void {
 		const shared = this.sharedTrace;
 		if (!shared || !shared.rootEmitted) return;
-		if (spans.some((span) => span.spanId === shared.rootSpanId)) {
-			shared.rootEmitted = false;
-		}
+		if (!spans.some((span) => span.spanId === shared.rootSpanId)) return;
+		if (statusCode === 409) return;
+		if (shared.rootReEmits >= MAX_ROOT_RE_EMITS) return;
+		shared.rootReEmits++;
+		shared.rootEmitted = false;
 	}
 
 	/**
 	 * Execution-end retry for a root whose export batch failed AFTER the last
 	 * `closeRun` (single LLM call, no tools: nothing else ever re-triggers
-	 * `emitSharedRootIfNeeded`). Called from the node's `closeFunction` when
-	 * n8n tears the execution down: if the root was attempted but is currently
-	 * un-latched (failed), re-emit the SAME `rootSpanId`. One extra attempt at
-	 * execution end, not a retry loop — if this POST also fails, the trace is
-	 * lost (accepted residual). Never throws.
+	 * `emitSharedRootIfNeeded`). Called via `finalize` — the node's
+	 * `closeFunction` entry point — when n8n tears the execution down: if the
+	 * root was attempted but is currently
+	 * un-latched (failed), re-emit the SAME `rootSpanId`. Still subject to the
+	 * overall `MAX_ROOT_RE_EMITS` bound — if the final attempt also fails, the
+	 * trace is lost (accepted residual). Never throws.
 	 */
 	retryPendingRoot(): void {
 		try {
@@ -288,10 +339,12 @@ export class RunTreeTracker {
 		});
 	}
 
+	// OTel convention: status stays UNSET (omitted) on success; only
+	// failures pass an explicit ERROR status.
 	private closeRun(
 		runId: string,
 		endAttributes: Record<string, OtlpAttrValue | undefined>,
-		status: { code: number; message?: string },
+		status?: { code: number; message?: string },
 	): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
@@ -315,13 +368,40 @@ export class RunTreeTracker {
 				...run.attributes,
 				...endAttributes,
 			}),
-			status,
+			...(status ? { status } : {}),
 		});
 	}
 
+	/**
+	 * Enforces `maxPayloadBytes` in UTF-8 BYTES (what actually crosses the
+	 * wire), not UTF-16 code units. The marker's own bytes are reserved
+	 * inside the budget, so truncated output never exceeds the limit (a
+	 * budget smaller than the marker itself floors at marker-only output).
+	 * For well-formed input the cut never lands inside a surrogate pair;
+	 * input already containing lone surrogates passes through as-is.
+	 */
 	private truncate(text: string): string {
 		const max = this.config.maxPayloadBytes;
-		return text.length > max ? `${text.slice(0, max)}…[truncated]` : text;
+		// A UTF-16 code unit is at most 3 UTF-8 bytes (4-byte code points are
+		// surrogate PAIRS — two units), so this fast path can never fit falsely.
+		if (text.length * 3 <= max) return text;
+		const encoder = new TextEncoder();
+		if (encoder.encode(text).length <= max) return text;
+		// Reserve the marker's bytes so content + marker stays within `max`.
+		const budget = Math.max(0, max - TRUNCATION_MARKER_BYTES);
+		// Binary search the longest prefix within the byte budget — UTF-8
+		// length is monotonic in prefix length. Every code unit encodes to at
+		// least 1 byte, so no prefix longer than `budget` units can fit.
+		let low = 0;
+		let high = Math.min(text.length, budget);
+		while (low < high) {
+			const mid = Math.ceil((low + high) / 2);
+			if (encoder.encode(text.slice(0, mid)).length <= budget) low = mid;
+			else high = mid - 1;
+		}
+		// Back off a trailing high surrogate so a pair is never split.
+		const end = low > 0 && text.charCodeAt(low - 1) >= 0xd800 && text.charCodeAt(low - 1) <= 0xdbff ? low - 1 : low;
+		return `${text.slice(0, end)}${TRUNCATION_MARKER}`;
 	}
 
 	private safeStringify(value: unknown): string {
@@ -385,9 +465,31 @@ export class RunTreeTracker {
 		const usage = tokenUsageFrom(result);
 		const completion = this.config.capturePrompts ? completionTextFrom(result) : undefined;
 		// Tool executions never reach a model-attached handler (measured live),
-		// but the model's own response names the tools it decided to call —
-		// surface that as an attribute so tool activity is at least visible.
-		const toolCalls = this.config.captureToolIO ? toolCallsFrom(result) : [];
+		// but the model's own response names the tools it decided to call.
+		// Extracted UNCONDITIONALLY: the pending ledger drives tool-span
+		// synthesis; only the gen_ai.tool_calls attribute stays gated by
+		// captureToolIO.
+		const toolCalls = toolCallsFrom(result);
+		// Only KNOWN runs may ledger tool calls: a stray handleLLMEnd for a run
+		// this tracker never opened must not seed phantom tool spans at finalize.
+		if (this.runs.has(runId) && toolCalls.length > 0) {
+			const requestedAtMs = this.now();
+			// Push at most the NEWEST ledger-cap's worth, then drain overflow in
+			// ONE splice — a shift()-per-entry loop is O(N²) and measurably
+			// blocks the event loop on giant malformed payloads.
+			for (const call of toolCalls.slice(-MAX_PENDING_TOOL_CALLS)) {
+				this.pendingToolCalls.push({
+					id: call.id,
+					name: call.name,
+					// Off means off for retention too: never pin argument graphs
+					// the export path would not read.
+					args: this.config.captureToolIO ? call.args : undefined,
+					requestedAtMs,
+				});
+			}
+			const excess = this.pendingToolCalls.length - MAX_PENDING_TOOL_CALLS;
+			if (excess > 0) this.pendingToolCalls.splice(0, excess);
+		}
 		this.closeRun(
 			runId,
 			{
@@ -395,10 +497,138 @@ export class RunTreeTracker {
 				'gen_ai.usage.output_tokens': usage.outputTokens,
 				'gen_ai.completion': completion === undefined ? undefined : this.truncate(completion),
 				'gen_ai.tool_calls':
-					toolCalls.length > 0 ? this.truncate(this.safeStringify(toolCalls)) : undefined,
+					this.config.captureToolIO && toolCalls.length > 0
+						? this.truncate(this.safeStringify(toolCalls))
+						: undefined,
 			},
-			{ code: STATUS_OK },
 		);
+	}
+
+	/**
+	 * Model-side tool-span synthesis, chat models only (plain `handleLLMStart`
+	 * prompts carry no tool messages). Tool executions never reach a
+	 * model-attached handler, but their data passes the model seat twice:
+	 * `handleLLMEnd`'s output names the calls the model requested (ledgered in
+	 * `closeLlmRun`), and the NEXT chat-model start echoes each tool RESULT as
+	 * a ToolMessage-like entry (`tool_call_id` + `content`). Matching results
+	 * to pending requests by `tool_call_id` yields one synthesized span per
+	 * completed call. Unmatched tool-result messages (no pending entry, e.g.
+	 * ledger overflow) are ignored.
+	 *
+	 * Timing caveat: start/end are reconstructed from the surrounding LLM-call
+	 * boundaries (previous `handleLLMEnd` -> this `handleChatModelStart`), so
+	 * the span includes n8n framework overhead, not pure tool runtime.
+	 */
+	private synthesizeToolSpansFrom(messages: unknown): void {
+		if (!this.config.singleTrace) return;
+		if (this.pendingToolCalls.length === 0 || !Array.isArray(messages)) return;
+		for (const message of (messages as unknown[]).flat()) {
+			// Per-message guard: a hostile property getter on one message must
+			// not abort the loop (or the caller's subsequent openLlmRun).
+			try {
+				const m = message as {
+					content?: unknown;
+					tool_call_id?: unknown;
+					_getType?: () => string;
+				} | null;
+				if (m === null || typeof m !== 'object') continue;
+				let isToolResult = typeof m.tool_call_id === 'string';
+				if (!isToolResult) {
+					try {
+						isToolResult = m._getType?.() === 'tool';
+					} catch {
+						/* detection is best-effort */
+					}
+				}
+				if (!isToolResult) continue;
+				// Empty-string ids count as absent on BOTH sides of the match —
+				// two id-less concurrent calls must not cross-match.
+				const callId =
+					typeof m.tool_call_id === 'string' && m.tool_call_id.length > 0 ? m.tool_call_id : undefined;
+				const index =
+					callId === undefined
+						? -1
+						: this.pendingToolCalls.findIndex(
+								(pending) =>
+									typeof pending.id === 'string' && pending.id.length > 0 && pending.id === callId,
+							);
+				if (index === -1) continue;
+				const [pending] = this.pendingToolCalls.splice(index, 1);
+				this.emitSynthesizedToolSpan(pending, { resultObserved: true, output: m.content });
+			} catch {
+				this.handlerErrors++;
+			}
+		}
+	}
+
+	/**
+	 * Synthesized `tool:<name>` span (provenance and timing caveat on
+	 * `synthesizeToolSpansFrom`). Only meaningful in singleTrace mode — the
+	 * only mode `wrapModelWithTracing` uses — where it parents under the
+	 * shared synthetic root. Status stays UNSET: tool success/failure is not
+	 * observable from the model seat.
+	 */
+	private emitSynthesizedToolSpan(
+		pending: PendingToolCall,
+		result: { resultObserved: boolean; output?: unknown },
+	): void {
+		if (!this.config.singleTrace) return;
+		const context = this.sharedTraceContext();
+		if (!context.sampled) return;
+		this.emitSharedRootIfNeeded();
+		const shared = this.sharedTrace;
+		if (!shared) return;
+		// Extraction is unvalidated — a malformed payload can put non-strings
+		// where ids/names belong; only emit them when they really are strings.
+		const toolName = typeof pending.name === 'string' ? pending.name : undefined;
+		const toolCallId = typeof pending.id === 'string' ? pending.id : undefined;
+		this.emit({
+			traceId: shared.traceId,
+			spanId: generateSpanId(),
+			parentSpanId: shared.rootSpanId,
+			name: `tool:${toolName ?? 'unknown'}`,
+			kind: SPAN_KIND_INTERNAL,
+			startTimeUnixNano: msToNanos(pending.requestedAtMs),
+			endTimeUnixNano: msToNanos(this.now()),
+			attributes: toOtlpAttributes({
+				...this.config.baseAttributes,
+				'gen_ai.operation.name': 'execute_tool',
+				'gen_ai.tool.name': toolName,
+				'gen_ai.tool.call.id': toolCallId,
+				'n8n.span.synthesized': true,
+				'n8n.tool.result_observed': result.resultObserved ? undefined : false,
+				'tool.input':
+					this.config.captureToolIO && pending.args !== undefined
+						? this.truncate(this.safeStringify(pending.args))
+						: undefined,
+				'tool.output':
+					this.config.captureToolIO && result.resultObserved
+						? this.truncate(this.safeStringify(result.output))
+						: undefined,
+			}),
+		});
+	}
+
+	/**
+	 * Execution-end flush — the `closeFunction` entry point wired by
+	 * `wrapModelWithTracing`. (a) Still-pending tool calls are flushed as
+	 * synthesized spans with `n8n.tool.result_observed: false` and no output:
+	 * the model requested the tool but no later model call carried its result
+	 * (typically an error mid-tool). (b) `retryPendingRoot` runs for a root
+	 * whose export batch failed after the last closeRun. Never throws.
+	 */
+	finalize(): void {
+		try {
+			if (this.config.singleTrace) {
+				const pending = this.pendingToolCalls.splice(0, this.pendingToolCalls.length);
+				for (const entry of pending) {
+					this.emitSynthesizedToolSpan(entry, { resultObserved: false });
+				}
+			}
+		} catch {
+			this.handlerErrors++;
+		}
+		this.retryPendingRoot();
 	}
 
 	/** Wraps every hook: record the event first, then do the work, swallow everything. */
@@ -425,6 +655,15 @@ export class RunTreeTracker {
 				'handleChatModelStart',
 				(args) => ({ runId: args[2] as string, parentRunId: args[3] as string | undefined }),
 				(llm, messages, runId, parentRunId, extraParams) => {
+					// Before opening the new LLM run: the incoming messages carry the
+					// RESULTS of tools the previous model call requested. Guarded on
+					// its own so even a wholesale synthesis failure (hostile messages
+					// container) still lets the LLM run open below.
+					try {
+						this.synthesizeToolSpansFrom(messages);
+					} catch {
+						this.handlerErrors++;
+					}
 					const promptText = this.config.capturePrompts ? this.serializeMessages(messages) : undefined;
 					this.openLlmRun(llm, promptText, runId, parentRunId, extraParams);
 				},
@@ -458,7 +697,7 @@ export class RunTreeTracker {
 			handleChainEnd: this.guarded(
 				'handleChainEnd',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
-				(_outputs, runId) => this.closeRun(runId, {}, { code: STATUS_OK }),
+				(_outputs, runId) => this.closeRun(runId, {}),
 			),
 			handleChainError: this.guarded(
 				'handleChainError',
@@ -478,15 +717,11 @@ export class RunTreeTracker {
 				'handleToolEnd',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
 				(output, runId) =>
-					this.closeRun(
-						runId,
-						{
-							'tool.output': this.config.captureToolIO
-								? this.truncate(this.safeStringify(output))
-								: undefined,
-						},
-						{ code: STATUS_OK },
-					),
+					this.closeRun(runId, {
+						'tool.output': this.config.captureToolIO
+							? this.truncate(this.safeStringify(output))
+							: undefined,
+					}),
 			),
 			handleToolError: this.guarded(
 				'handleToolError',

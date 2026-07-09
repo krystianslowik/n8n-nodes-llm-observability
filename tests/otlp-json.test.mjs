@@ -7,7 +7,6 @@ import {
 	msToNanos,
 	toOtlpAttributes,
 	SPAN_KIND_CLIENT,
-	STATUS_OK,
 } from '../dist/nodes/TraceExporter/shared/otlpJson.js';
 
 test('generateTraceId returns 32 lowercase hex chars, unique per call', () => {
@@ -50,7 +49,7 @@ test('buildExportRequest produces the OTLP ExportTraceServiceRequest shape', () 
 		startTimeUnixNano: '1000000',
 		endTimeUnixNano: '2000000',
 		attributes: toOtlpAttributes({ 'gen_ai.system': 'openai' }),
-		status: { code: STATUS_OK },
+		// status omitted: OTel UNSET convention for successful spans
 	};
 	const body = buildExportRequest({ 'service.name': 'n8n-trace-exporter' }, [span]);
 	assert.deepEqual(body, {
