@@ -1,52 +1,67 @@
 {
-    "name": "n8n-nodes-llm-observability",
-    "version": "0.1.0",
-    "description": "n8n community node package for exporting AI Agent / LLM traces (OpenTelemetry GenAI semantic conventions) to Langfuse, Comet Opik, Datadog, or any OTLP collector, plus evaluation scores and dataset items.",
-    "license": "MIT",
-    "homepage": "https://github.com/krystianslowik/n8n-nodes-llm-observability",
-    "keywords": [
-        "n8n-community-node-package"
-    ],
-    "author": {
-        "name": "Krystian Słowik",
-        "email": "krystian.slowik@n8n.io"
-    },
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/krystianslowik/n8n-nodes-llm-observability.git"
-    },
-    "scripts": {
-        "build": "n8n-node build",
-        "test": "npm run build && node --test tests/*.test.mjs",
-        "build:watch": "tsc --watch",
-        "dev": "n8n-node dev",
-        "lint": "n8n-node lint",
-        "lint:fix": "n8n-node lint --fix",
-        "release": "n8n-node release",
-        "prepublishOnly": "n8n-node prerelease"
-    },
-    "files": [
-        "dist"
-    ],
-    "n8n": {
-        "n8nNodesApiVersion": 1,
-        "strict": true,
-        "credentials": [
-            "dist/credentials/OtlpExporterApi.credentials.js"
-        ],
-        "nodes": [
-            "dist/nodes/TraceExporter/TraceExporter.node.js",
-            "dist/nodes/Observability/Observability.node.js"
-        ]
-    },
-    "devDependencies": {
-        "@n8n/node-cli": "*",
-        "eslint": "9.32.0",
-        "prettier": "3.6.2",
-        "release-it": "^19.0.4",
-        "typescript": "5.9.2"
-    },
-    "peerDependencies": {
-        "n8n-workflow": "*"
-    }
+	"name": "n8n-nodes-observability",
+	"version": "0.1.0",
+	"description": "n8n community node that adds OpenTelemetry tracing to AI Agent workflows: insert the Trace Exporter between any Chat Model and the AI Agent to export LLM traces (tokens, cost, latency, prompts) to Comet Opik, Langfuse, Datadog, or any OTLP collector.",
+	"license": "MIT",
+	"homepage": "https://github.com/krystianslowik/n8n-nodes-llm-observability",
+	"keywords": [
+		"n8n-community-node-package",
+		"observability",
+		"opentelemetry",
+		"otlp",
+		"llm",
+		"tracing",
+		"opik",
+		"langfuse",
+		"datadog",
+		"ai-agent"
+	],
+	"author": {
+		"name": "Krystian Słowik",
+		"email": "me@krystianslowik.com"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/krystianslowik/n8n-nodes-llm-observability.git"
+	},
+	"scripts": {
+		"build": "n8n-node build",
+		"test": "npm run build && node --test tests/*.test.mjs",
+		"build:watch": "tsc --watch",
+		"dev": "n8n-node dev",
+		"lint": "n8n-node lint",
+		"lint:fix": "n8n-node lint --fix",
+		"release": "n8n-node release",
+		"prepublishOnly": "n8n-node prerelease"
+	},
+	"files": [
+		"dist"
+	],
+	"n8n": {
+		"n8nNodesApiVersion": 1,
+		"strict": true,
+		"credentials": [
+			"dist/credentials/OtlpExporterApi.credentials.js"
+		],
+		"nodes": [
+			"dist/nodes/TraceExporter/TraceExporter.node.js"
+		]
+	},
+	"devDependencies": {
+		"@n8n/node-cli": "*",
+		"eslint": "9.32.0",
+		"prettier": "3.6.2",
+		"release-it": "^19.0.4",
+		"typescript": "5.9.2"
+	},
+	"peerDependencies": {
+		"n8n-workflow": "*"
+	},
+	"engines": {
+		"node": ">=22.22.0"
+	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	}
 }

@@ -69,8 +69,10 @@ jobs:
     permissions:
       # Required to mint an OIDC token for npm provenance attestation.
       id-token: write
-      # Scoped down from the default (write) for least-privilege publishing.
-      contents: read
+      # Required to create the GitHub release for the tag.
+      contents: write
+      # Required to mirror the package to GitHub Packages.
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -78,13 +80,31 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 'lts/*'
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Preflight
+        # Fail fast if the tag doesn't match package.json, and detect versions
+        # already on npm (e.g. a re-tag after a partial release) so the publish
+        # can be skipped instead of failing the whole run.
+        id: preflight
+        run: |
+          VERSION=$(npm pkg get version | tr -d '"')
+          NAME=$(npm pkg get name | tr -d '"')
+          if [ "$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $VERSION"
+            exit 1
+          fi
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already on npm — skipping publish."
+            echo "already-published=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Release
+        if: steps.preflight.outputs.already-published != 'true'
         # Publishes to npm with a provenance attestation (requires id-token: write above).
         # Lint and build run automatically as part of the release process.
         #
@@ -97,3 +117,40 @@ jobs:
           npm run release
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub release
+        # Runs only after the npm publish above succeeded. Release notes are
+        # the tag's section from CHANGELOG.md (falls back to auto-generated
+        # notes if the section is missing).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists — skipping."
+            exit 0
+          fi
+          awk -v v="$VERSION" '$0 ~ "^## " v " " {flag=1; next} /^## /{flag=0} flag' CHANGELOG.md > /tmp/release-notes.md
+          if [ -s /tmp/release-notes.md ]; then
+            gh release create "$VERSION" --title "v$VERSION" --notes-file /tmp/release-notes.md --verify-tag
+          else
+            gh release create "$VERSION" --title "v$VERSION" --generate-notes --verify-tag
+          fi
+
+      - name: Mirror to GitHub Packages
+        # Publishes a scoped copy (@<owner>/<name>) to GitHub Packages so the
+        # package shows up in the repository's Packages sidebar. npmjs.org
+        # remains the canonical registry; this mirror is best-effort and must
+        # not fail the release.
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          npm config set //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
+          NAME=$(npm pkg get name | tr -d '"')
+          npm pkg set name="@${GITHUB_REPOSITORY_OWNER}/${NAME}"
+          # --ignore-scripts: the prepublishOnly hook (n8n-node prerelease)
+          # already ran for the canonical npmjs publish and fails outside the
+          # release-it context; the built dist/ is published as-is.
+          npm publish --registry https://npm.pkg.github.com --provenance=false --ignore-scripts
+          git checkout -- package.json
