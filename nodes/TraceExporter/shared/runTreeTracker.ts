@@ -113,6 +113,8 @@ export class RunTreeTracker {
 		traceId: string;
 		rootSpanId: string;
 		rootEmitted: boolean;
+		/** True once the root has been handed to the exporter at least once. */
+		rootAttempted: boolean;
 		sampled: boolean;
 	};
 
@@ -154,6 +156,7 @@ export class RunTreeTracker {
 				traceId: generateTraceId(),
 				rootSpanId: generateSpanId(),
 				rootEmitted: false,
+				rootAttempted: false,
 				sampled: this.decideSampled(),
 			};
 			this.sampledByTraceId.set(this.sharedTrace.traceId, this.sharedTrace.sampled);
@@ -173,12 +176,18 @@ export class RunTreeTracker {
 	 * here is decoupled from the POST. If that export batch fails,
 	 * `notifyExportFailed` resets the latch so this method re-emits the exact
 	 * same `rootSpanId` on the next call, retrying the root without orphaning
-	 * children that already reference it.
+	 * children that already reference it. The next call normally comes from a
+	 * later `closeRun`; when there is none (single LLM call, no tools),
+	 * `retryPendingRoot` — invoked from the node's `closeFunction` at
+	 * execution end — is the last chance. Accepted residual: if that
+	 * execution-end retry POST also fails, there is no further retry (one
+	 * extra attempt, not a retry loop) and the trace is lost.
 	 */
 	private emitSharedRootIfNeeded(): void {
 		const shared = this.sharedTrace;
 		if (!shared || shared.rootEmitted || !shared.sampled) return;
 		shared.rootEmitted = true;
+		shared.rootAttempted = true;
 		this.emit({
 			traceId: shared.traceId,
 			spanId: shared.rootSpanId,
@@ -204,6 +213,25 @@ export class RunTreeTracker {
 		if (!shared || !shared.rootEmitted) return;
 		if (spans.some((span) => span.spanId === shared.rootSpanId)) {
 			shared.rootEmitted = false;
+		}
+	}
+
+	/**
+	 * Execution-end retry for a root whose export batch failed AFTER the last
+	 * `closeRun` (single LLM call, no tools: nothing else ever re-triggers
+	 * `emitSharedRootIfNeeded`). Called from the node's `closeFunction` when
+	 * n8n tears the execution down: if the root was attempted but is currently
+	 * un-latched (failed), re-emit the SAME `rootSpanId`. One extra attempt at
+	 * execution end, not a retry loop — if this POST also fails, the trace is
+	 * lost (accepted residual). Never throws.
+	 */
+	retryPendingRoot(): void {
+		try {
+			const shared = this.sharedTrace;
+			if (!shared || !shared.rootAttempted || shared.rootEmitted) return;
+			this.emitSharedRootIfNeeded();
+		} catch {
+			this.handlerErrors++;
 		}
 	}
 

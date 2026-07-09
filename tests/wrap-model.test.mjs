@@ -223,6 +223,52 @@ test('root re-emits with the SAME spanId after its export batch fails, so late-a
 	// with the exact spanId both children point to as their parent.
 });
 
+test('single-closeRun execution: closeFunction retries the failed root at execution end (and still evicts)', async () => {
+	const httpCalls = [];
+	let callCount = 0;
+	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry-at-close');
+	// Fail ONLY the solo root batch; the child batch and the retry succeed.
+	ctx.helpers.httpRequest = async (options) => {
+		callCount++;
+		httpCalls.push(options);
+		if (callCount === 1) throw new Error('backend down for the root batch');
+	};
+
+	const modelA = { callbacks: [] };
+	const { model, closeFunction } = wrapModelWithTracing(ctx, modelA, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+
+	// Exactly ONE LLM call: no later closeRun ever re-triggers the root emit,
+	// so without the execution-end retry the trace stays orphaned forever.
+	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-only');
+	handler.handleLLMEnd({}, 'run-only');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const bodiesBeforeClose = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(bodiesBeforeClose.length, 2, 'before closeFunction: only failed root + child were POSTed');
+
+	await closeFunction();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(bodies.length, 3, 'three POSTs: failed root, child, root retried at execution end');
+	const [failedRoot] = bodies[0];
+	const [child] = bodies[1];
+	const [retriedRoot] = bodies[2];
+	assert.equal(retriedRoot.spanId, failedRoot.spanId, 'execution-end retry re-emits the SAME root spanId');
+	assert.equal(retriedRoot.parentSpanId, undefined, 'the retried root is still parentless');
+	assert.equal(child.parentSpanId, retriedRoot.spanId, "child's parentSpanId matches the root the backend finally got");
+
+	// closeFunction still evicts the registry entry: same executionId now
+	// builds a FRESH pipeline.
+	const modelB = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-root-retry-at-close'), modelB, OPTIONS, CREDENTIAL);
+	assert.notEqual(modelB.callbacks[0], handler, 'registry entry was deleted by closeFunction');
+});
+
 test("closeFunction evicts the execution's pipeline: a later wrap call gets a FRESH handler", async () => {
 	const httpCalls = [];
 	const modelA = { callbacks: [] };

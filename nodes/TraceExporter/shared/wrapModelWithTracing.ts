@@ -106,9 +106,37 @@ function collectBaseAttributes(
  * the safety net for pipelines whose execution never reaches `closeFunction`
  * (e.g. a crash), so long-lived instances still can't grow this without
  * bound.
+ *
+ * Each entry also carries the tracker's `retryPendingRoot` so `closeFunction`
+ * can fire the execution-end root retry (see `RunTreeTracker.retryPendingRoot`)
+ * before deleting the entry.
  */
-const pipelineByExecution = new Map<string, TracingHooks>();
+interface PipelineEntry {
+	handler: TracingHooks;
+	retryPendingRoot: () => void;
+}
+
+const pipelineByExecution = new Map<string, PipelineEntry>();
 const MAX_PIPELINES = 200;
+
+/**
+ * Retry the execution's pending root (if any), then evict the registry entry.
+ * Returned as `SupplyData.closeFunction` from every supplyData call of the
+ * execution — idempotent, n8n may call it several times.
+ */
+function buildCloseFunction(registryKey: string): () => Promise<void> {
+	return async () => {
+		const entry = pipelineByExecution.get(registryKey);
+		if (entry) {
+			try {
+				entry.retryPendingRoot();
+			} catch {
+				/* never break the workflow */
+			}
+		}
+		pipelineByExecution.delete(registryKey);
+	};
+}
 
 /** Result of {@link wrapModelWithTracing} — the model plus its eviction hook. */
 export interface WrappedModel {
@@ -137,8 +165,8 @@ export function wrapModelWithTracing(
 			registryKey = undefined;
 		}
 		const existing = registryKey ? pipelineByExecution.get(registryKey) : undefined;
-		if (existing) {
-			if (!attachHandler(model, existing)) {
+		if (existing && registryKey) {
+			if (!attachHandler(model, existing.handler)) {
 				try {
 					ctx.logger.warn(
 						'[TraceExporter] could not attach tracing callbacks to the supplied model; passing it through untraced',
@@ -147,14 +175,7 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			}
-			return {
-				model,
-				closeFunction: registryKey
-					? async () => {
-							pipelineByExecution.delete(registryKey);
-						}
-					: undefined,
-			};
+			return { model, closeFunction: buildCloseFunction(registryKey) };
 		}
 
 		const target = buildExportTarget(credential);
@@ -207,7 +228,10 @@ export function wrapModelWithTracing(
 				const oldest = pipelineByExecution.keys().next().value;
 				if (oldest !== undefined) pipelineByExecution.delete(oldest);
 			}
-			pipelineByExecution.set(registryKey, handler);
+			pipelineByExecution.set(registryKey, {
+				handler,
+				retryPendingRoot: () => tracker.retryPendingRoot(),
+			});
 		}
 		const attached = attachHandler(model, handler);
 		if (!attached) {
@@ -221,11 +245,7 @@ export function wrapModelWithTracing(
 		}
 		return {
 			model,
-			closeFunction: registryKey
-				? async () => {
-						pipelineByExecution.delete(registryKey);
-					}
-				: undefined,
+			closeFunction: registryKey ? buildCloseFunction(registryKey) : undefined,
 		};
 	} catch (error) {
 		try {
