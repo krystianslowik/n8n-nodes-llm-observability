@@ -46,8 +46,16 @@ export interface TrackerConfig {
 	 * Measured live in the spike: n8n's AI Agent invokes the model with no
 	 * LangChain parent context (parentRunId is always undefined), so without
 	 * this, each LLM call of one agent execution becomes its own trace.
+	 *
+	 * A synthetic ROOT span is emitted before the trace's first real span and
+	 * every parentless span is parented under it. Also measured live: Opik's
+	 * OTLP intake creates a trace per parentless span and answers 409 "Trace
+	 * already exists" for later batches with another parentless span on the
+	 * same traceId — child spans, by contrast, append cleanly.
 	 */
 	singleTrace?: boolean;
+	/** Name of the synthetic root span (e.g. the node's Trace Name option). */
+	rootSpanName?: string;
 }
 
 interface OpenRun {
@@ -89,12 +97,21 @@ export class RunTreeTracker {
 
 	private readonly sampledByTraceId = new Map<string, boolean>();
 
-	private sharedTrace?: { traceId: string; sampled: boolean };
+	private sharedTrace?: {
+		traceId: string;
+		rootSpanId: string;
+		rootEmitted: boolean;
+		sampled: boolean;
+	};
+
+	private readonly startedAtMs: number;
 
 	constructor(
 		private readonly config: TrackerConfig,
 		private readonly emit: (span: OtlpSpan) => void,
-	) {}
+	) {
+		this.startedAtMs = this.now();
+	}
 
 	private now(): number {
 		return this.config.now ? this.config.now() : Date.now();
@@ -121,10 +138,38 @@ export class RunTreeTracker {
 
 	private sharedTraceContext(): { traceId: string; sampled: boolean } {
 		if (!this.sharedTrace) {
-			this.sharedTrace = { traceId: generateTraceId(), sampled: this.decideSampled() };
+			this.sharedTrace = {
+				traceId: generateTraceId(),
+				rootSpanId: generateSpanId(),
+				rootEmitted: false,
+				sampled: this.decideSampled(),
+			};
 			this.sampledByTraceId.set(this.sharedTrace.traceId, this.sharedTrace.sampled);
 		}
-		return this.sharedTrace;
+		return { traceId: this.sharedTrace.traceId, sampled: this.sharedTrace.sampled };
+	}
+
+	/**
+	 * Emit the shared trace's synthetic root before its first real span, so
+	 * the backend's trace entity is created exactly once (Opik 409 semantics —
+	 * see `singleTrace` doc). Children appended in later batches may end after
+	 * this root's recorded end time; that approximation is a known spike
+	 * trade-off (no timers, no end-of-execution hook to close the root with).
+	 */
+	private emitSharedRootIfNeeded(): void {
+		const shared = this.sharedTrace;
+		if (!shared || shared.rootEmitted || !shared.sampled) return;
+		shared.rootEmitted = true;
+		this.emit({
+			traceId: shared.traceId,
+			spanId: shared.rootSpanId,
+			name: this.config.rootSpanName ?? 'n8n agent execution',
+			kind: SPAN_KIND_INTERNAL,
+			startTimeUnixNano: msToNanos(this.startedAtMs),
+			endTimeUnixNano: msToNanos(this.now()),
+			attributes: toOtlpAttributes(this.config.baseAttributes),
+			status: { code: STATUS_OK },
+		});
 	}
 
 	private traceContextFor(parentRunId?: string): {
@@ -189,10 +234,15 @@ export class RunTreeTracker {
 		if (!run) return;
 		this.runs.delete(runId);
 		if (!(this.sampledByTraceId.get(run.traceId) ?? true)) return;
+		let parentSpanId = run.parentSpanId;
+		if (this.sharedTrace && run.traceId === this.sharedTrace.traceId) {
+			this.emitSharedRootIfNeeded();
+			parentSpanId = parentSpanId ?? this.sharedTrace.rootSpanId;
+		}
 		this.emit({
 			traceId: run.traceId,
 			spanId: run.spanId,
-			parentSpanId: run.parentSpanId,
+			parentSpanId,
 			name: run.name,
 			kind: run.kind,
 			startTimeUnixNano: msToNanos(run.startMs),

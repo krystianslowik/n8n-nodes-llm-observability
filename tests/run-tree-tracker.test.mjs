@@ -145,9 +145,15 @@ test('singleTrace groups parentless runs and distinct unseen parents into one tr
 	handler.handleLLMEnd(OPENAI_RESULT, 'run-2');
 	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-3', undefined);
 	handler.handleLLMEnd(OPENAI_RESULT, 'run-3');
-	assert.equal(spans.length, 3);
-	assert.equal(spans[0].traceId, spans[1].traceId);
-	assert.equal(spans[1].traceId, spans[2].traceId);
+	// 1 synthetic root (emitted before the first real span) + 3 llm spans
+	assert.equal(spans.length, 4);
+	assert.ok(spans.every((s) => s.traceId === spans[0].traceId));
+	const root = spans[0];
+	assert.equal(root.kind, 1, 'root is INTERNAL');
+	assert.equal(root.parentSpanId, undefined);
+	for (const llmSpan of spans.slice(1)) {
+		assert.equal(llmSpan.parentSpanId, root.spanId, 'llm spans parented under the synthetic root');
+	}
 });
 
 test('chat messages serialize as role/content, not [object Object]', () => {

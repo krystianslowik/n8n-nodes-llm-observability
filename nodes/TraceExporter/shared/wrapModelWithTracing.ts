@@ -159,6 +159,7 @@ export function wrapModelWithTracing(
 				maxPayloadBytes: Math.max(1, options.maxPayloadSizeKb) * 1024,
 				samplingRatePercent: options.samplingRatePercent,
 				singleTrace: true,
+				rootSpanName: options.traceName || 'n8n agent execution',
 				baseAttributes: collectBaseAttributes(ctx, options),
 				onEvent: (event) => {
 					try {

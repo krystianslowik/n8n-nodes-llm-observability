@@ -83,11 +83,17 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	);
 	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 4, completionTokens: 2 } } }, 'run-1');
 	await flushMicrotasks();
+	await flushMicrotasks();
 
-	assert.equal(httpCalls.length, 1);
+	// synthetic root flushes first, then the llm span (Opik 409 semantics)
+	const allSpans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(allSpans.length, 2);
 	assert.equal(httpCalls[0].method, 'POST');
 	assert.equal(httpCalls[0].url, 'http://opik.local/api/v1/private/otel/v1/traces');
-	const exportedSpan = httpCalls[0].body.resourceSpans[0].scopeSpans[0].spans[0];
+	const [rootSpan, exportedSpan] = allSpans;
+	assert.equal(rootSpan.name, 'spike', 'root named after the Trace Name option');
+	assert.equal(exportedSpan.parentSpanId, rootSpan.spanId);
+	assert.equal(exportedSpan.traceId, rootSpan.traceId);
 	const attrs = Object.fromEntries(exportedSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
 	assert.equal(attrs['n8n.workflow.id'], 'wf-9');
 	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
@@ -141,9 +147,13 @@ test('one execution shares one pipeline: spans from separate wrap calls share a 
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(spans.length, 2);
-	assert.equal(spans[0].traceId, spans[1].traceId, 'one execution -> one trace');
-	assert.notEqual(spans[0].spanId, spans[1].spanId);
+	// synthetic root + 2 llm spans, all in one trace
+	assert.equal(spans.length, 3);
+	assert.ok(spans.every((s) => s.traceId === spans[0].traceId), 'one execution -> one trace');
+	const [root, llm1, llm2] = spans;
+	assert.equal(llm1.parentSpanId, root.spanId);
+	assert.equal(llm2.parentSpanId, root.spanId);
+	assert.notEqual(llm1.spanId, llm2.spanId);
 });
 
 test('different executions get different pipelines and traces', async () => {
@@ -160,6 +170,8 @@ test('different executions get different pipelines and traces', async () => {
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(spans.length, 2);
-	assert.notEqual(spans[0].traceId, spans[1].traceId);
+	// each execution: synthetic root + 1 llm span
+	assert.equal(spans.length, 4);
+	const traceIds = new Set(spans.map((s) => s.traceId));
+	assert.equal(traceIds.size, 2);
 });
