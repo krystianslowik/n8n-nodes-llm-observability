@@ -6,6 +6,7 @@ import {
 	type SupplyData,
 } from 'n8n-workflow';
 
+import type { OtlpCredential } from './shared/otlpExport';
 import { wrapModelWithTracing, type TraceExporterOptions } from './shared/wrapModelWithTracing';
 
 /**
@@ -174,7 +175,7 @@ export class TraceExporter implements INodeType {
 			traceName: this.getNodeParameter('traceName', itemIndex, '') as string,
 			sessionId: this.getNodeParameter('sessionId', itemIndex, '') as string,
 			userId: this.getNodeParameter('userId', itemIndex, '') as string,
-			metadata: this.getNodeParameter('metadata', itemIndex, {}) as Record<string, unknown>,
+			metadata: this.getNodeParameter('metadata', itemIndex, {}),
 			capturePrompts: options.capturePrompts ?? false,
 			captureToolIO: options.captureToolIO ?? false,
 			maxPayloadSizeKb: options.maxPayloadSizeKb ?? 32,
@@ -182,13 +183,13 @@ export class TraceExporter implements INodeType {
 			redactionPatterns: options.redactionPatterns ?? [],
 		};
 
-		// STUB (PRD F1-F4, O1): `wrapModelWithTracing` currently returns `model`
-		// unchanged. See `shared/wrapModelWithTracing.ts` for the full TODO on
-		// what the real OTel-emitting callback wrapper needs to do.
-		const wrappedModel = wrapModelWithTracing(this, model, traceExporterOptions);
+		const credential = (await this.getCredentials(
+			'otlpExporterApi',
+			itemIndex,
+		)) as unknown as OtlpCredential;
 
 		return {
-			response: wrappedModel,
+			response: wrapModelWithTracing(this, model, traceExporterOptions, credential),
 		};
 	}
 }
