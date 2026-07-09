@@ -9,6 +9,7 @@ import {
 	genAiSystemFrom,
 	modelNameFrom,
 	tokenUsageFrom,
+	toolCallsFrom,
 } from './genAiAttributes';
 import {
 	generateSpanId,
@@ -40,6 +41,13 @@ export interface TrackerConfig {
 	now?: () => number;
 	/** Fires per hook invocation — the live run logs these lines; they ARE the capture-depth measurement. */
 	onEvent?: (event: TrackerEvent) => void;
+	/**
+	 * Group every run without an observed parent into ONE shared trace.
+	 * Measured live in the spike: n8n's AI Agent invokes the model with no
+	 * LangChain parent context (parentRunId is always undefined), so without
+	 * this, each LLM call of one agent execution becomes its own trace.
+	 */
+	singleTrace?: boolean;
 }
 
 interface OpenRun {
@@ -81,6 +89,8 @@ export class RunTreeTracker {
 
 	private readonly sampledByTraceId = new Map<string, boolean>();
 
+	private sharedTrace?: { traceId: string; sampled: boolean };
+
 	constructor(
 		private readonly config: TrackerConfig,
 		private readonly emit: (span: OtlpSpan) => void,
@@ -109,6 +119,14 @@ export class RunTreeTracker {
 		return byte[0] < (rate / 100) * 256;
 	}
 
+	private sharedTraceContext(): { traceId: string; sampled: boolean } {
+		if (!this.sharedTrace) {
+			this.sharedTrace = { traceId: generateTraceId(), sampled: this.decideSampled() };
+			this.sampledByTraceId.set(this.sharedTrace.traceId, this.sharedTrace.sampled);
+		}
+		return this.sharedTrace;
+	}
+
 	private traceContextFor(parentRunId?: string): {
 		traceId: string;
 		parentSpanId?: string;
@@ -125,11 +143,17 @@ export class RunTreeTracker {
 			}
 			let unseen = this.traceForUnseenParent.get(parentRunId);
 			if (!unseen) {
-				unseen = { traceId: generateTraceId(), sampled: this.decideSampled() };
+				unseen = this.config.singleTrace
+					? { ...this.sharedTraceContext() }
+					: { traceId: generateTraceId(), sampled: this.decideSampled() };
 				this.traceForUnseenParent.set(parentRunId, unseen);
 				this.sampledByTraceId.set(unseen.traceId, unseen.sampled);
 			}
 			return { traceId: unseen.traceId, sampled: unseen.sampled };
+		}
+		if (this.config.singleTrace) {
+			const shared = this.sharedTraceContext();
+			return { traceId: shared.traceId, sampled: shared.sampled };
 		}
 		const traceId = generateTraceId();
 		const sampled = this.decideSampled();
@@ -196,6 +220,30 @@ export class RunTreeTracker {
 		}
 	}
 
+	/**
+	 * LangChain chat messages are class instances (sometimes with circular
+	 * refs); bare JSON.stringify degrades to "[object Object]" — measured live
+	 * in the spike. Extract role+content per message instead.
+	 */
+	private serializeMessages(messages: unknown): string {
+		if (!Array.isArray(messages)) return this.safeStringify(messages);
+		const simplified = (messages as unknown[]).flat().map((message) => {
+			const m = message as {
+				content?: unknown;
+				_getType?: () => string;
+				constructor?: { name?: string };
+			} | null;
+			let role = 'unknown';
+			try {
+				role = m?._getType?.() ?? m?.constructor?.name ?? 'unknown';
+			} catch {
+				/* role is best-effort */
+			}
+			return { role, content: m?.content ?? this.safeStringify(message) };
+		});
+		return this.safeStringify(simplified);
+	}
+
 	private componentName(component?: SerializedComponent | null): string {
 		const id = component?.id;
 		if (Array.isArray(id) && id.length > 0) return String(id[id.length - 1]);
@@ -223,12 +271,18 @@ export class RunTreeTracker {
 		const result = output ?? {};
 		const usage = tokenUsageFrom(result);
 		const completion = this.config.capturePrompts ? completionTextFrom(result) : undefined;
+		// Tool executions never reach a model-attached handler (measured live),
+		// but the model's own response names the tools it decided to call —
+		// surface that as an attribute so tool activity is at least visible.
+		const toolCalls = this.config.captureToolIO ? toolCallsFrom(result) : [];
 		this.closeRun(
 			runId,
 			{
 				'gen_ai.usage.input_tokens': usage.inputTokens,
 				'gen_ai.usage.output_tokens': usage.outputTokens,
 				'gen_ai.completion': completion === undefined ? undefined : this.truncate(completion),
+				'gen_ai.tool_calls':
+					toolCalls.length > 0 ? this.truncate(this.safeStringify(toolCalls)) : undefined,
 			},
 			{ code: STATUS_OK },
 		);
@@ -258,7 +312,7 @@ export class RunTreeTracker {
 				'handleChatModelStart',
 				(args) => ({ runId: args[2] as string, parentRunId: args[3] as string | undefined }),
 				(llm, messages, runId, parentRunId, extraParams) => {
-					const promptText = this.config.capturePrompts ? this.safeStringify(messages) : undefined;
+					const promptText = this.config.capturePrompts ? this.serializeMessages(messages) : undefined;
 					this.openLlmRun(llm, promptText, runId, parentRunId, extraParams);
 				},
 			),

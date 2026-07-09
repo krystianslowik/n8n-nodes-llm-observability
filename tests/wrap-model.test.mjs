@@ -16,7 +16,10 @@ const OPTIONS = {
 
 const CREDENTIAL = { endpointUrl: 'http://opik.local/api/v1/private/otel', authType: 'customHeaders' };
 
-function fakeCtx(httpCalls, logs = []) {
+// NOTE: wrapModelWithTracing keeps a module-level pipeline registry keyed on
+// (executionId, node name), so every test must use a UNIQUE execution id to
+// stay isolated from the others.
+function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
 	return {
 		helpers: {
 			httpRequest: async (options) => {
@@ -30,7 +33,7 @@ function fakeCtx(httpCalls, logs = []) {
 			debug: (m) => logs.push(['debug', m]),
 		},
 		getWorkflow: () => ({ id: 'wf-9', name: 'Spike WF', active: false }),
-		getExecutionId: () => 'exec-7',
+		getExecutionId: () => executionId,
 		getNode: () => ({ name: 'Trace Exporter' }),
 	};
 }
@@ -65,7 +68,7 @@ test('attachHandler returns false for non-objects', () => {
 
 test('wrapModelWithTracing returns the same instance and exports a span end-to-end', async () => {
 	const httpCalls = [];
-	const ctx = fakeCtx(httpCalls);
+	const ctx = fakeCtx(httpCalls, [], 'exec-e2e');
 	const model = { callbacks: [] };
 	const returned = wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
 	assert.equal(returned, model);
@@ -87,7 +90,7 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	const exportedSpan = httpCalls[0].body.resourceSpans[0].scopeSpans[0].spans[0];
 	const attrs = Object.fromEntries(exportedSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
 	assert.equal(attrs['n8n.workflow.id'], 'wf-9');
-	assert.equal(attrs['n8n.execution.id'], 'exec-7');
+	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
 	assert.equal(attrs['session.id'], 'sess-1');
 	assert.equal(attrs['user.id'], 'user-1');
 	assert.equal(attrs['gen_ai.request.model'], 'gpt-4o-mini');
@@ -95,7 +98,7 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 
 test('export failure is swallowed: no unhandled rejection, warning logged', async () => {
 	const logs = [];
-	const ctx = fakeCtx([], logs);
+	const ctx = fakeCtx([], logs, 'exec-fail');
 	ctx.helpers.httpRequest = async () => {
 		throw new Error('opik down');
 	};
@@ -122,4 +125,41 @@ test('wrapModelWithTracing never throws — broken ctx still returns the model',
 	const broken = {};
 	const returned = wrapModelWithTracing(broken, model, OPTIONS, CREDENTIAL);
 	assert.equal(returned, model);
+});
+
+test('one execution shares one pipeline: spans from separate wrap calls share a traceId', async () => {
+	const httpCalls = [];
+	const modelA = { callbacks: [] };
+	const modelB = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-shared'), modelA, OPTIONS, CREDENTIAL);
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-shared'), modelB, OPTIONS, CREDENTIAL);
+	assert.equal(modelA.callbacks[0], modelB.callbacks[0], 'same handler reused for one execution');
+	modelA.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-a');
+	modelA.callbacks[0].handleLLMEnd({}, 'run-a');
+	modelB.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-b');
+	modelB.callbacks[0].handleLLMEnd({}, 'run-b');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(spans.length, 2);
+	assert.equal(spans[0].traceId, spans[1].traceId, 'one execution -> one trace');
+	assert.notEqual(spans[0].spanId, spans[1].spanId);
+});
+
+test('different executions get different pipelines and traces', async () => {
+	const httpCalls = [];
+	const modelA = { callbacks: [] };
+	const modelB = { callbacks: [] };
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-one'), modelA, OPTIONS, CREDENTIAL);
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-two'), modelB, OPTIONS, CREDENTIAL);
+	assert.notEqual(modelA.callbacks[0], modelB.callbacks[0]);
+	modelA.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-a');
+	modelA.callbacks[0].handleLLMEnd({}, 'run-a');
+	modelB.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-b');
+	modelB.callbacks[0].handleLLMEnd({}, 'run-b');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.equal(spans.length, 2);
+	assert.notEqual(spans[0].traceId, spans[1].traceId);
 });

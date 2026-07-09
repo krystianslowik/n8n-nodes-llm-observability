@@ -1,0 +1,204 @@
+{
+  "updatedAt": "2026-07-09T13:55:07.122Z",
+  "createdAt": "2026-07-09T13:51:57.199Z",
+  "name": "My workflow",
+  "description": null,
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "621156eb-074f-4c25-88de-7c3b05d450d7",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        208,
+        0
+      ],
+      "id": "2baf4609-e658-41de-9a35-e391547a51dd",
+      "name": "When chat message received",
+      "webhookId": "59bb24fe-92cf-4789-a3eb-5bef3b29e6da"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "What is 37*91? You must use the calculator tool to compute it.",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        416,
+        0
+      ],
+      "id": "7c651512-186a-4ca5-8eab-07ad980ed679",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "traceName": "spike-session-1",
+        "sessionId": "spike-session-1",
+        "userId": "spike-user-1",
+        "options": {
+          "capturePrompts": true,
+          "captureToolIO": true
+        }
+      },
+      "type": "CUSTOM.traceExporter",
+      "typeVersion": 1,
+      "position": [
+        288,
+        208
+      ],
+      "id": "ff8363b9-0fbb-4af6-9eb1-1d53a6d26074",
+      "name": "Trace Exporter",
+      "credentials": {
+        "otlpExporterApi": {
+          "id": "REPLACE_ME",
+          "name": "OTLP Exporter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-sonnet-4-6",
+          "cachedResultName": "Claude Sonnet 4.6"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.5,
+      "position": [
+        224,
+        416
+      ],
+      "id": "2be75407-c489-44de-9b91-0e484e2fceeb",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "REPLACE_ME",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.toolCalculator",
+      "typeVersion": 1,
+      "position": [
+        576,
+        208
+      ],
+      "id": "b2f0ecb3-71a2-4312-8b93-20d1ff6b9ad0",
+      "name": "Calculator"
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trace Exporter": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Trace Exporter",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculator": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "nodeGroups": [],
+  "pinData": {},
+  "activeVersionId": null,
+  "versionCounter": 13,
+  "triggerCount": 0,
+  "sourceWorkflowId": null,
+  "shared": [
+    {
+      "updatedAt": "2026-07-09T13:51:57.200Z",
+      "createdAt": "2026-07-09T13:51:57.200Z",
+      "role": "workflow:owner",
+      "workflowId": "IkPjReA8nlrVBiuR",
+      "projectId": "kIoJr8UtiHQhqona",
+      "project": {
+        "updatedAt": "2026-07-09T13:51:32.901Z",
+        "createdAt": "2026-07-09T13:42:16.161Z",
+        "id": "kIoJr8UtiHQhqona",
+        "name": "saadwasd sadas <me@krystianslowik.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "customTelemetryTags": [],
+        "creatorId": "f7df63c0-a37d-4265-b593-5780bd969dda"
+      }
+    }
+  ],
+  "versionMetadata": {
+    "name": null,
+    "description": null
+  }
+}

@@ -134,3 +134,55 @@ test('onEvent callback receives each event (live-run logging path)', () => {
 	handler.handleToolEnd('y', 't-1');
 	assert.deepEqual(seen, ['handleToolStart', 'handleToolEnd']);
 });
+
+test('singleTrace groups parentless runs and distinct unseen parents into one trace', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker({ ...baseConfig, singleTrace: true }, (s) => spans.push(s));
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1', 'unseen-parent-A');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-2', 'unseen-parent-B');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-2');
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-3', undefined);
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-3');
+	assert.equal(spans.length, 3);
+	assert.equal(spans[0].traceId, spans[1].traceId);
+	assert.equal(spans[1].traceId, spans[2].traceId);
+});
+
+test('chat messages serialize as role/content, not [object Object]', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker({ ...baseConfig, capturePrompts: true }, (s) => spans.push(s));
+	const handler = tracker.createHandler();
+	const message = { content: 'What is 37*91?', _getType: () => 'human' };
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[message]], 'run-1');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	const attrs = attrMap(spans[0]);
+	assert.ok(String(attrs['gen_ai.prompt']).includes('What is 37*91?'), 'content present');
+	assert.ok(String(attrs['gen_ai.prompt']).includes('human'), 'role present');
+	assert.ok(!String(attrs['gen_ai.prompt']).includes('[object Object]'));
+});
+
+test('model-decided tool calls surface as gen_ai.tool_calls when captureToolIO is on', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker({ ...baseConfig, captureToolIO: true }, (s) => spans.push(s));
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd(
+		{ generations: [[{ message: { tool_calls: [{ name: 'calculator', args: { input: '37*91' }, id: 'tc1' }] } }]] },
+		'run-1',
+	);
+	const attrs = attrMap(spans[0]);
+	assert.ok(String(attrs['gen_ai.tool_calls']).includes('calculator'));
+	assert.ok(String(attrs['gen_ai.tool_calls']).includes('37*91'));
+
+	const spansOff = [];
+	const trackerOff = new RunTreeTracker(baseConfig, (s) => spansOff.push(s));
+	const handlerOff = trackerOff.createHandler();
+	handlerOff.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handlerOff.handleLLMEnd(
+		{ generations: [[{ message: { tool_calls: [{ name: 'calculator', args: {}, id: 'tc1' }] } }]] },
+		'run-1',
+	);
+	assert.equal(attrMap(spansOff[0])['gen_ai.tool_calls'], undefined, 'off by default');
+});

@@ -54,3 +54,15 @@ export function completionTextFrom(output: LlmResultLike): string | undefined {
 	const text = output.generations?.[0]?.[0]?.text;
 	return typeof text === 'string' && text.length > 0 ? text : undefined;
 }
+
+/**
+ * Tool calls the model decided to make, from LangChain's provider-normalized
+ * `message.tool_calls`. Tool *executions* never reach a model-attached
+ * callback handler (measured live in the spike) — this is the model-side view
+ * of tool activity, which is the best a passthrough sub-node can observe.
+ */
+export function toolCallsFrom(output: LlmResultLike): Array<{ name?: string; args?: unknown }> {
+	const calls = output.generations?.[0]?.[0]?.message?.tool_calls;
+	if (!Array.isArray(calls)) return [];
+	return calls.map((call) => ({ name: call?.name, args: call?.args }));
+}

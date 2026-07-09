@@ -161,7 +161,12 @@ export class TraceExporter implements INodeType {
 	};
 
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
-		const model = await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, itemIndex);
+		// Bare-string `inputs` entries allow unlimited connections, so
+		// getInputConnectionData returns an ARRAY of supplied models here —
+		// verified live in the spike (attaching to the array traces nothing).
+		// Unwrap to the first (and in practice only) connected model.
+		const supplied = await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, itemIndex);
+		const model = Array.isArray(supplied) ? (supplied[0] as unknown) : supplied;
 
 		const options = this.getNodeParameter('options', itemIndex, {}) as {
 			capturePrompts?: boolean;

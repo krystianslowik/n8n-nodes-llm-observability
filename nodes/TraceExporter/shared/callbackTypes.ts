@@ -18,7 +18,11 @@ export interface LlmResultLike {
 	generations?: Array<
 		Array<{
 			text?: string;
-			message?: { usage_metadata?: { input_tokens?: number; output_tokens?: number } };
+			message?: {
+				usage_metadata?: { input_tokens?: number; output_tokens?: number };
+				/** LangChain-normalized tool calls the model decided to make (provider-agnostic). */
+				tool_calls?: Array<{ name?: string; args?: unknown; id?: string }>;
+			};
 		}>
 	>;
 	llmOutput?: {

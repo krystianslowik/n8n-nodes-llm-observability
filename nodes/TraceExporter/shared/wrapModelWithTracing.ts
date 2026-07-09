@@ -95,6 +95,16 @@ function collectBaseAttributes(
 }
 
 /**
+ * One tracing pipeline per (execution, node): measured live in the spike,
+ * n8n's AI Agent re-calls supplyData for EVERY model invocation, so per-call
+ * pipelines would split one agent run into one trace per LLM call. Module
+ * scope survives across those calls within the n8n process; bounded so
+ * long-lived instances can't grow it without limit.
+ */
+const pipelineByExecution = new Map<string, TracingHooks>();
+const MAX_PIPELINES = 200;
+
+/**
  * Wraps the supplied LangChain model with the OTel tracing pipeline (spec
  * §"Wire-up"): tracker (callback hooks -> spans) -> exporter (spans -> OTLP/
  * JSON POST via ctx.helpers.httpRequest, fire-and-forget). Returns the SAME
@@ -108,6 +118,26 @@ export function wrapModelWithTracing(
 	credential: OtlpCredential,
 ): unknown {
 	try {
+		let registryKey: string | undefined;
+		try {
+			registryKey = `${ctx.getExecutionId()}::${ctx.getNode().name}`;
+		} catch {
+			registryKey = undefined;
+		}
+		const existing = registryKey ? pipelineByExecution.get(registryKey) : undefined;
+		if (existing) {
+			if (!attachHandler(model, existing)) {
+				try {
+					ctx.logger.warn(
+						'[TraceExporter] could not attach tracing callbacks to the supplied model; passing it through untraced',
+					);
+				} catch {
+					/* never break the workflow */
+				}
+			}
+			return model;
+		}
+
 		const target = buildExportTarget(credential);
 		const exporter = new SpanExporter(
 			target,
@@ -128,6 +158,7 @@ export function wrapModelWithTracing(
 				captureToolIO: options.captureToolIO,
 				maxPayloadBytes: Math.max(1, options.maxPayloadSizeKb) * 1024,
 				samplingRatePercent: options.samplingRatePercent,
+				singleTrace: true,
 				baseAttributes: collectBaseAttributes(ctx, options),
 				onEvent: (event) => {
 					try {
@@ -141,7 +172,15 @@ export function wrapModelWithTracing(
 			},
 			(span) => exporter.add(span),
 		);
-		const attached = attachHandler(model, tracker.createHandler());
+		const handler = tracker.createHandler();
+		if (registryKey) {
+			if (pipelineByExecution.size >= MAX_PIPELINES) {
+				const oldest = pipelineByExecution.keys().next().value;
+				if (oldest !== undefined) pipelineByExecution.delete(oldest);
+			}
+			pipelineByExecution.set(registryKey, handler);
+		}
+		const attached = attachHandler(model, handler);
 		if (!attached) {
 			try {
 				ctx.logger.warn(
