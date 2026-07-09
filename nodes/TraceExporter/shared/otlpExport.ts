@@ -94,10 +94,12 @@ export class SpanExporter {
 	private flush(): void {
 		if (this.inFlight || this.queue.length === 0) return;
 		const spans = this.queue.splice(0);
-		const body = buildExportRequest(this.resourceAttributes, spans);
 		this.inFlight = true;
 		void Promise.resolve()
-			.then(async () => this.post(this.target.url, this.target.headers, body))
+			.then(async () => {
+				const body = buildExportRequest(this.resourceAttributes, spans);
+				return this.post(this.target.url, this.target.headers, body);
+			})
 			.then(() => {
 				this.exportedSpans += spans.length;
 			})

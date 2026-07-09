@@ -109,6 +109,27 @@ test('SpanExporter swallows post failures, counts them, reports via onError, nev
 	}
 });
 
+test('SpanExporter guards body construction: garbage resourceAttributes never throws into add() and counts an export error', async () => {
+	let unhandled = 0;
+	const onUnhandled = () => unhandled++;
+	process.on('unhandledRejection', onUnhandled);
+	try {
+		const exporter = new SpanExporter(
+			{ url: 'http://x', headers: {} },
+			async () => {},
+			null, // garbage: buildExportRequest will throw on Object.entries(null)
+		);
+		assert.doesNotThrow(() => exporter.add(span()));
+		await flushMicrotasks();
+		await flushMicrotasks();
+		assert.equal(exporter.exportErrors, 1);
+		assert.equal(exporter.exportedSpans, 0);
+		assert.equal(unhandled, 0);
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+	}
+});
+
 test('SpanExporter bounds the queue and counts drops when posts never drain', async () => {
 	let resolvePost;
 	const gate = new Promise((resolve) => {
