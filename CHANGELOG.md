@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.3 - 2026-07-10
+
+### Fixed
+
+- Reconstruct tool spans from n8n Tools Agent V3's measured
+  `Calling <tool> with input: <JSON>` history when current OpenAI Responses
+  callbacks omit `message.tool_calls`, including ID-based de-duplication with
+  provider-reported calls.
+- Export tool I/O under OTel GenAI `gen_ai.tool.call.arguments` / `result` and
+  mark reconstructed tools as first-class `tool` spans in Opik.
+- Export prompts and completions as structured `gen_ai.input.messages` /
+  `gen_ai.output.messages` instead of deprecated prompt/completion fields.
+- Close the synthetic root after the final model answer, so the Opik trace has
+  its first input, final output, and a duration that contains every child span.
+
 ## 0.1.2 - 2026-07-09
 
 ### Fixed

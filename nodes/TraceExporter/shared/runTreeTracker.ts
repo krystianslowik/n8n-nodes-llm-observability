@@ -46,11 +46,11 @@ export interface TrackerConfig {
 	 * LangChain parent context (parentRunId is always undefined), so without
 	 * this, each LLM call of one agent execution becomes its own trace.
 	 *
-	 * A synthetic ROOT span is emitted before the trace's first real span and
-	 * every parentless span is parented under it. Also measured live: Opik's
-	 * OTLP intake creates a trace per parentless span and answers 409 "Trace
-	 * already exists" for later batches with another parentless span on the
-	 * same traceId — child spans, by contrast, append cleanly.
+	 * Every parentless span is parented under one synthetic ROOT. The ROOT is
+	 * emitted after the final model answer (or from `finalize` as a fallback),
+	 * so its input/output and duration describe the whole execution. Verified
+	 * live against Opik: child spans may arrive before their ROOT, while a
+	 * second parentless span on the same trace still produces a 409.
 	 */
 	singleTrace?: boolean;
 	/** Name of the synthetic root span (e.g. the node's Trace Name option). */
@@ -122,19 +122,13 @@ const TRUNCATION_MARKER_BYTES = new TextEncoder().encode(TRUNCATION_MARKER).leng
  *
  * With `singleTrace` (the only mode `wrapModelWithTracing` uses), every
  * parentless/unseen-parent run in one tracker is parented under a single
- * synthetic ROOT span, emitted once before the trace's first real span (see
- * `emitSharedRootIfNeeded`) — one agent execution stays one trace. That root
- * ships as its own solo export batch, the coldest request against the
- * backend: if it fails, every child span already sent (or about to be sent)
- * references a parentSpanId the backend never received. `notifyExportFailed`
- * closes that gap — when the exporter reports a failed batch containing the
- * root, the tracker re-arms emission so the next `closeRun` re-emits the
- * SAME root spanId; children that already referenced it become valid once
- * it lands. A 409 failure re-latches instead of re-arming — it proves the
- * backend already ingested the root (Opik answers 409 for a second
- * parentless span on a known traceId — see `singleTrace` doc above
- * `TrackerConfig`) — and re-emission is bounded at `MAX_ROOT_RE_EMITS` per
- * execution.
+ * synthetic ROOT span — one agent execution stays one trace. Children ship
+ * as they finish; the ROOT ships after the final answer so it can close with
+ * full trace input/output and duration. `notifyExportFailed` re-arms a
+ * failed ROOT using the SAME rootSpanId, so already-exported children remain
+ * correctly linked when the retry lands. A 409 re-latches instead (the
+ * backend already has that parentless ROOT), and re-emission is bounded at
+ * `MAX_ROOT_RE_EMITS` per execution.
  */
 export class RunTreeTracker {
 	readonly events: TrackerEvent[] = [];
@@ -152,6 +146,11 @@ export class RunTreeTracker {
 	private sharedTrace?: {
 		traceId: string;
 		rootSpanId: string;
+		/** First model input and final model output, present only when capture is enabled. */
+		input?: string;
+		output?: string;
+		/** End of the final model answer (or execution-close fallback). */
+		endMs?: number;
 		rootEmitted: boolean;
 		/** True once the root has been handed to the exporter at least once. */
 		rootAttempted: boolean;
@@ -161,6 +160,9 @@ export class RunTreeTracker {
 	};
 
 	private readonly startedAtMs: number;
+
+	/** Last model boundary, used to reconstruct tool timing from V3 message history. */
+	private lastLlmEndMs?: number;
 
 	constructor(
 		private readonly config: TrackerConfig,
@@ -208,21 +210,20 @@ export class RunTreeTracker {
 	}
 
 	/**
-	 * Emit the shared trace's synthetic root before its first real span, so
-	 * the backend's trace entity is created exactly once (Opik 409 semantics —
-	 * see `singleTrace` doc). Children appended in later batches may end after
-	 * this root's recorded end time; that approximation is a known spike
-	 * trade-off (no timers, no end-of-execution hook to close the root with).
+	 * Emit the shared trace's synthetic root once the final model answer is
+	 * known. Child spans are deliberately allowed to export first: live Opik
+	 * verification proves it accepts a child referencing a not-yet-ingested
+	 * parent and later attaches the ROOT cleanly. This lets the ROOT carry the
+	 * execution's real first input, final output, and end time.
 	 *
 	 * `rootEmitted` latches optimistically — set as soon as the root is handed
 	 * to the exporter, before the export outcome is known — because emission
 	 * here is decoupled from the POST. If that export batch fails,
 	 * `notifyExportFailed` resets the latch so this method re-emits the exact
-	 * same `rootSpanId` on the next call, retrying the root without orphaning
-	 * children that already reference it. The next call normally comes from a
-	 * later `closeRun`; when there is none (single LLM call, no tools),
-	 * `retryPendingRoot` — invoked via `finalize` from the node's
-	 * `closeFunction` at execution end — is the last chance. Re-emission is
+	 * same `rootSpanId` on the next final answer, retrying the root without
+	 * orphaning children that already reference it. When there is no later
+	 * answer, `retryPendingRoot` from the node's `closeFunction` is the last
+	 * chance. Re-emission is
 	 * bounded: at most `MAX_ROOT_RE_EMITS` re-emits per execution
 	 * (`notifyExportFailed` stops un-latching past that), and a 409 failure
 	 * re-latches instead of retrying. Accepted residual: if every bounded
@@ -239,8 +240,12 @@ export class RunTreeTracker {
 			name: this.config.rootSpanName ?? 'n8n agent execution',
 			kind: SPAN_KIND_INTERNAL,
 			startTimeUnixNano: msToNanos(this.startedAtMs),
-			endTimeUnixNano: msToNanos(this.now()),
-			attributes: toOtlpAttributes(this.config.baseAttributes),
+			endTimeUnixNano: msToNanos(shared.endMs ?? this.now()),
+			attributes: toOtlpAttributes({
+				...this.config.baseAttributes,
+				input: shared.input,
+				output: shared.output,
+			}),
 		});
 	}
 
@@ -352,7 +357,6 @@ export class RunTreeTracker {
 		if (!(this.sampledByTraceId.get(run.traceId) ?? true)) return;
 		let parentSpanId = run.parentSpanId;
 		if (this.sharedTrace && run.traceId === this.sharedTrace.traceId) {
-			this.emitSharedRootIfNeeded();
 			parentSpanId = parentSpanId ?? this.sharedTrace.rootSpanId;
 		}
 		this.emit({
@@ -400,7 +404,10 @@ export class RunTreeTracker {
 			else high = mid - 1;
 		}
 		// Back off a trailing high surrogate so a pair is never split.
-		const end = low > 0 && text.charCodeAt(low - 1) >= 0xd800 && text.charCodeAt(low - 1) <= 0xdbff ? low - 1 : low;
+		const end =
+			low > 0 && text.charCodeAt(low - 1) >= 0xd800 && text.charCodeAt(low - 1) <= 0xdbff
+				? low - 1
+				: low;
 		return `${text.slice(0, end)}${TRUNCATION_MARKER}`;
 	}
 
@@ -413,28 +420,95 @@ export class RunTreeTracker {
 		}
 	}
 
+	private messageRole(message: unknown): string {
+		const m = message as { _getType?: () => string; constructor?: { name?: string } } | null;
+		let raw = 'unknown';
+		try {
+			raw = m?._getType?.() ?? m?.constructor?.name ?? 'unknown';
+		} catch {
+			/* role is best-effort */
+		}
+		switch (raw.toLowerCase()) {
+			case 'human':
+			case 'humanmessage':
+				return 'user';
+			case 'ai':
+			case 'aimessage':
+				return 'assistant';
+			case 'tool':
+			case 'toolmessage':
+				return 'tool';
+			case 'systemmessage':
+				return 'system';
+			default:
+				return raw.toLowerCase();
+		}
+	}
+
 	/**
 	 * LangChain chat messages are class instances (sometimes with circular
-	 * refs); bare JSON.stringify degrades to "[object Object]" — measured live
-	 * in the spike. Extract role+content per message instead.
+	 * refs); bare JSON.stringify degrades to "[object Object]". Convert them to
+	 * the current OTel `gen_ai.input.messages` role/parts schema instead.
 	 */
 	private serializeMessages(messages: unknown): string {
 		if (!Array.isArray(messages)) return this.safeStringify(messages);
 		const simplified = (messages as unknown[]).flat().map((message) => {
 			const m = message as {
 				content?: unknown;
-				_getType?: () => string;
-				constructor?: { name?: string };
+				tool_call_id?: unknown;
+				tool_calls?: Array<{ id?: unknown; name?: unknown; args?: unknown }>;
 			} | null;
-			let role = 'unknown';
-			try {
-				role = m?._getType?.() ?? m?.constructor?.name ?? 'unknown';
-			} catch {
-				/* role is best-effort */
+			const role = this.messageRole(message);
+			const parts: Array<Record<string, unknown>> = [];
+			const content = m?.content;
+			if (role === 'tool') {
+				parts.push({
+					type: 'tool_call_response',
+					...(typeof m?.tool_call_id === 'string' && m.tool_call_id.length > 0
+						? { id: m.tool_call_id }
+						: {}),
+					result: content,
+				});
+			} else if (content !== undefined && content !== '') {
+				parts.push({
+					type: 'text',
+					content: typeof content === 'string' ? content : this.safeStringify(content),
+				});
 			}
-			return { role, content: m?.content ?? this.safeStringify(message) };
+			if (this.config.captureToolIO && Array.isArray(m?.tool_calls)) {
+				for (const call of m.tool_calls.slice(0, MAX_PENDING_TOOL_CALLS)) {
+					parts.push({
+						type: 'tool_call',
+						...(typeof call.id === 'string' ? { id: call.id } : {}),
+						...(typeof call.name === 'string' ? { name: call.name } : {}),
+						arguments: call.args,
+					});
+				}
+			}
+			return { role, parts };
 		});
 		return this.safeStringify(simplified);
+	}
+
+	private serializeOutputMessages(
+		completion: string | undefined,
+		toolCalls: Array<{ id?: string; name?: string; args?: unknown }>,
+	): string | undefined {
+		const parts: Array<Record<string, unknown>> = [];
+		if (completion !== undefined && completion.length > 0) {
+			parts.push({ type: 'text', content: completion });
+		}
+		if (this.config.captureToolIO) {
+			for (const call of toolCalls) {
+				parts.push({
+					type: 'tool_call',
+					...(typeof call.id === 'string' ? { id: call.id } : {}),
+					...(typeof call.name === 'string' ? { name: call.name } : {}),
+					arguments: call.args,
+				});
+			}
+		}
+		return parts.length > 0 ? this.safeStringify([{ role: 'assistant', parts }]) : undefined;
 	}
 
 	private componentName(component?: SerializedComponent | null): string {
@@ -452,28 +526,46 @@ export class RunTreeTracker {
 	): void {
 		const serialized = llm ?? undefined;
 		const model = modelNameFrom(serialized, extraParams);
-		this.openRun(runId, parentRunId, `llm:${model ?? this.componentName(serialized)}`, SPAN_KIND_CLIENT, {
-			'gen_ai.system': genAiSystemFrom(serialized),
-			'gen_ai.request.model': model,
-			'gen_ai.prompt':
-				this.config.capturePrompts && promptText !== undefined ? this.truncate(promptText) : undefined,
-		});
+		const capturedInput =
+			this.config.capturePrompts && promptText !== undefined
+				? this.truncate(promptText)
+				: undefined;
+		this.openRun(
+			runId,
+			parentRunId,
+			`llm:${model ?? this.componentName(serialized)}`,
+			SPAN_KIND_CLIENT,
+			{
+				'gen_ai.system': genAiSystemFrom(serialized),
+				'gen_ai.operation.name': 'chat',
+				'gen_ai.request.model': model,
+				'gen_ai.input.messages': capturedInput,
+			},
+		);
+		if (this.config.singleTrace && capturedInput !== undefined) {
+			this.sharedTraceContext();
+			if (this.sharedTrace && this.sharedTrace.input === undefined) {
+				this.sharedTrace.input = capturedInput;
+			}
+		}
 	}
 
 	private closeLlmRun(output: LlmResultLike | null, runId: string): void {
 		const result = output ?? {};
 		const usage = tokenUsageFrom(result);
-		const completion = this.config.capturePrompts ? completionTextFrom(result) : undefined;
+		const completion = completionTextFrom(result);
 		// Tool executions never reach a model-attached handler (measured live),
 		// but the model's own response names the tools it decided to call.
 		// Extracted UNCONDITIONALLY: the pending ledger drives tool-span
-		// synthesis; only the gen_ai.tool_calls attribute stays gated by
-		// captureToolIO.
+		// synthesis; content fields in output messages stay gated by the node's
+		// capture options.
 		const toolCalls = toolCallsFrom(result);
+		const endedAtMs = this.now();
+		this.lastLlmEndMs = endedAtMs;
 		// Only KNOWN runs may ledger tool calls: a stray handleLLMEnd for a run
 		// this tracker never opened must not seed phantom tool spans at finalize.
 		if (this.runs.has(runId) && toolCalls.length > 0) {
-			const requestedAtMs = this.now();
+			const requestedAtMs = endedAtMs;
 			// Push at most the NEWEST ledger-cap's worth, then drain overflow in
 			// ONE splice — a shift()-per-entry loop is O(N²) and measurably
 			// blocks the event loop on giant malformed payloads.
@@ -490,38 +582,102 @@ export class RunTreeTracker {
 			const excess = this.pendingToolCalls.length - MAX_PENDING_TOOL_CALLS;
 			if (excess > 0) this.pendingToolCalls.splice(0, excess);
 		}
-		this.closeRun(
-			runId,
-			{
-				'gen_ai.usage.input_tokens': usage.inputTokens,
-				'gen_ai.usage.output_tokens': usage.outputTokens,
-				'gen_ai.completion': completion === undefined ? undefined : this.truncate(completion),
-				'gen_ai.tool_calls':
-					this.config.captureToolIO && toolCalls.length > 0
-						? this.truncate(this.safeStringify(toolCalls))
-						: undefined,
-			},
+		const serializedOutput = this.serializeOutputMessages(
+			this.config.capturePrompts ? completion : undefined,
+			toolCalls,
 		);
+		this.closeRun(runId, {
+			'gen_ai.usage.input_tokens': usage.inputTokens,
+			'gen_ai.usage.output_tokens': usage.outputTokens,
+			'gen_ai.output.messages':
+				serializedOutput === undefined ? undefined : this.truncate(serializedOutput),
+		});
+		// A non-empty model answer with no requested tools is the successful end
+		// of the normal V3 agent loop. Tool-only responses have empty text, so a
+		// provider payload that hides tool_calls cannot close the ROOT too early.
+		if (this.config.singleTrace && toolCalls.length === 0 && completion) {
+			this.sharedTraceContext();
+			if (this.sharedTrace) {
+				this.sharedTrace.endMs = endedAtMs;
+				this.sharedTrace.output = this.config.capturePrompts
+					? this.truncate(completion)
+					: undefined;
+			}
+			this.emitSharedRootIfNeeded();
+		}
+	}
+
+	private closeLlmError(error: unknown, runId: string): void {
+		const endedAtMs = this.now();
+		this.closeRun(runId, {}, { code: STATUS_ERROR, message: String(error).slice(0, 500) });
+		if (!this.config.singleTrace) return;
+		this.sharedTraceContext();
+		if (this.sharedTrace) this.sharedTrace.endMs = endedAtMs;
+		this.emitSharedRootIfNeeded();
 	}
 
 	/**
 	 * Model-side tool-span synthesis, chat models only (plain `handleLLMStart`
 	 * prompts carry no tool messages). Tool executions never reach a
 	 * model-attached handler, but their data passes the model seat twice:
-	 * `handleLLMEnd`'s output names the calls the model requested (ledgered in
+	 * `handleLLMEnd` usually names the requested calls (ledgered in
 	 * `closeLlmRun`), and the NEXT chat-model start echoes each tool RESULT as
-	 * a ToolMessage-like entry (`tool_call_id` + `content`). Matching results
-	 * to pending requests by `tool_call_id` yields one synthesized span per
-	 * completed call. Unmatched tool-result messages (no pending entry, e.g.
-	 * ledger overflow) are ignored.
+	 * a ToolMessage-like entry (`tool_call_id` + `content`). On n8n's current
+	 * OpenAI Responses path, however, the end callback omits tool_calls; V3
+	 * still adds an assistant message shaped `Calling <name> with input: <JSON>`
+	 * immediately before the tool result. That measured fallback is parsed and
+	 * de-duplicated against the provider-side ledger here.
 	 *
 	 * Timing caveat: start/end are reconstructed from the surrounding LLM-call
 	 * boundaries (previous `handleLLMEnd` -> this `handleChatModelStart`), so
 	 * the span includes n8n framework overhead, not pure tool runtime.
 	 */
+	private pendingToolById(callId: string, calls: PendingToolCall[]): PendingToolCall | undefined {
+		const index = calls.findIndex(
+			(pending) => typeof pending.id === 'string' && pending.id.length > 0 && pending.id === callId,
+		);
+		if (index === -1) return undefined;
+		const [pending] = calls.splice(index, 1);
+		return pending;
+	}
+
+	private n8nToolCallSummary(content: unknown): PendingToolCall | undefined {
+		if (typeof content !== 'string' || !content.startsWith('Calling ')) return undefined;
+		const separator = ' with input: ';
+		const separatorAt = content.indexOf(separator, 'Calling '.length);
+		if (separatorAt === -1) return undefined;
+		const name = content.slice('Calling '.length, separatorAt).trim();
+		if (!name) return undefined;
+
+		const rawArgs = content.slice(separatorAt + separator.length);
+		let parsedArgs: unknown = rawArgs;
+		try {
+			parsedArgs = JSON.parse(rawArgs);
+		} catch {
+			/* retain the raw string */
+		}
+		const parsedRecord =
+			parsedArgs !== null && typeof parsedArgs === 'object'
+				? (parsedArgs as Record<string, unknown>)
+				: undefined;
+		const callId = typeof parsedRecord?.id === 'string' ? parsedRecord.id : undefined;
+		let toolArgs = parsedArgs;
+		if (callId !== undefined && parsedRecord) {
+			// n8n V3 adds the provider call ID to its display envelope. It is
+			// correlation metadata, not an argument the tool received.
+			toolArgs = { ...parsedRecord, id: undefined };
+		}
+		return {
+			id: callId,
+			name,
+			args: this.config.captureToolIO ? toolArgs : undefined,
+			requestedAtMs: this.lastLlmEndMs ?? this.now(),
+		};
+	}
+
 	private synthesizeToolSpansFrom(messages: unknown): void {
-		if (!this.config.singleTrace) return;
-		if (this.pendingToolCalls.length === 0 || !Array.isArray(messages)) return;
+		if (!this.config.singleTrace || !Array.isArray(messages)) return;
+		const callsFromMessages: PendingToolCall[] = [];
 		for (const message of (messages as unknown[]).flat()) {
 			// Per-message guard: a hostile property getter on one message must
 			// not abort the loop (or the caller's subsequent openLlmRun).
@@ -532,28 +688,34 @@ export class RunTreeTracker {
 					_getType?: () => string;
 				} | null;
 				if (m === null || typeof m !== 'object') continue;
+
+				if (this.messageRole(m) === 'assistant') {
+					const fromSummary = this.n8nToolCallSummary(m.content);
+					if (fromSummary) {
+						const ledgered = fromSummary.id
+							? this.pendingToolById(fromSummary.id, this.pendingToolCalls)
+							: undefined;
+						callsFromMessages.push(ledgered ?? fromSummary);
+						continue;
+					}
+				}
+
 				let isToolResult = typeof m.tool_call_id === 'string';
 				if (!isToolResult) {
-					try {
-						isToolResult = m._getType?.() === 'tool';
-					} catch {
-						/* detection is best-effort */
-					}
+					isToolResult = this.messageRole(m) === 'tool';
 				}
 				if (!isToolResult) continue;
 				// Empty-string ids count as absent on BOTH sides of the match —
 				// two id-less concurrent calls must not cross-match.
 				const callId =
-					typeof m.tool_call_id === 'string' && m.tool_call_id.length > 0 ? m.tool_call_id : undefined;
-				const index =
-					callId === undefined
-						? -1
-						: this.pendingToolCalls.findIndex(
-								(pending) =>
-									typeof pending.id === 'string' && pending.id.length > 0 && pending.id === callId,
-							);
-				if (index === -1) continue;
-				const [pending] = this.pendingToolCalls.splice(index, 1);
+					typeof m.tool_call_id === 'string' && m.tool_call_id.length > 0
+						? m.tool_call_id
+						: undefined;
+				const pending = callId
+					? (this.pendingToolById(callId, callsFromMessages) ??
+						this.pendingToolById(callId, this.pendingToolCalls))
+					: callsFromMessages.shift();
+				if (!pending) continue;
 				this.emitSynthesizedToolSpan(pending, { resultObserved: true, output: m.content });
 			} catch {
 				this.handlerErrors++;
@@ -562,7 +724,7 @@ export class RunTreeTracker {
 	}
 
 	/**
-	 * Synthesized `tool:<name>` span (provenance and timing caveat on
+	 * Synthesized `execute_tool <name>` span (provenance and timing caveat on
 	 * `synthesizeToolSpansFrom`). Only meaningful in singleTrace mode — the
 	 * only mode `wrapModelWithTracing` uses — where it parents under the
 	 * shared synthetic root. Status stays UNSET: tool success/failure is not
@@ -575,7 +737,6 @@ export class RunTreeTracker {
 		if (!this.config.singleTrace) return;
 		const context = this.sharedTraceContext();
 		if (!context.sampled) return;
-		this.emitSharedRootIfNeeded();
 		const shared = this.sharedTrace;
 		if (!shared) return;
 		// Extraction is unvalidated — a malformed payload can put non-strings
@@ -586,7 +747,7 @@ export class RunTreeTracker {
 			traceId: shared.traceId,
 			spanId: generateSpanId(),
 			parentSpanId: shared.rootSpanId,
-			name: `tool:${toolName ?? 'unknown'}`,
+			name: `execute_tool ${toolName ?? 'unknown'}`,
 			kind: SPAN_KIND_INTERNAL,
 			startTimeUnixNano: msToNanos(pending.requestedAtMs),
 			endTimeUnixNano: msToNanos(result.endMs ?? this.now()),
@@ -594,14 +755,20 @@ export class RunTreeTracker {
 				...this.config.baseAttributes,
 				'gen_ai.operation.name': 'execute_tool',
 				'gen_ai.tool.name': toolName,
+				'gen_ai.tool.type': 'function',
 				'gen_ai.tool.call.id': toolCallId,
+				// Opik currently maps the standard GenAI tool I/O but does not use
+				// it to set SpanType.tool. Its LiveKit name rule does. This single
+				// compatibility marker makes the span first-class in Opik while the
+				// standard gen_ai.* attributes remain the source of truth.
+				'lk.function_tool.name': toolName,
 				'n8n.span.synthesized': true,
 				'n8n.tool.result_observed': result.resultObserved ? undefined : false,
-				'tool.input':
+				'gen_ai.tool.call.arguments':
 					this.config.captureToolIO && pending.args !== undefined
 						? this.truncate(this.safeStringify(pending.args))
 						: undefined,
-				'tool.output':
+				'gen_ai.tool.call.result':
 					this.config.captureToolIO && result.resultObserved
 						? this.truncate(this.safeStringify(result.output))
 						: undefined,
@@ -628,6 +795,10 @@ export class RunTreeTracker {
 				const pending = this.pendingToolCalls.splice(0, this.pendingToolCalls.length);
 				for (const entry of pending) {
 					this.emitSynthesizedToolSpan(entry, { resultObserved: false, endMs: atMs });
+				}
+				if (this.sharedTrace && !this.sharedTrace.rootAttempted) {
+					this.sharedTrace.endMs = atMs ?? this.now();
+					this.emitSharedRootIfNeeded();
 				}
 			}
 		} catch {
@@ -669,7 +840,9 @@ export class RunTreeTracker {
 					} catch {
 						this.handlerErrors++;
 					}
-					const promptText = this.config.capturePrompts ? this.serializeMessages(messages) : undefined;
+					const promptText = this.config.capturePrompts
+						? this.serializeMessages(messages)
+						: undefined;
 					this.openLlmRun(llm, promptText, runId, parentRunId, extraParams);
 				},
 			),
@@ -690,14 +863,19 @@ export class RunTreeTracker {
 			handleLLMError: this.guarded(
 				'handleLLMError',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
-				(error, runId) =>
-					this.closeRun(runId, {}, { code: STATUS_ERROR, message: String(error).slice(0, 500) }),
+				(error, runId) => this.closeLlmError(error, runId),
 			),
 			handleChainStart: this.guarded(
 				'handleChainStart',
 				(args) => ({ runId: args[2] as string, parentRunId: args[3] as string | undefined }),
 				(chain, _inputs, runId, parentRunId) =>
-					this.openRun(runId, parentRunId, `chain:${this.componentName(chain)}`, SPAN_KIND_INTERNAL, {}),
+					this.openRun(
+						runId,
+						parentRunId,
+						`chain:${this.componentName(chain)}`,
+						SPAN_KIND_INTERNAL,
+						{},
+					),
 			),
 			handleChainEnd: this.guarded(
 				'handleChainEnd',
@@ -713,17 +891,25 @@ export class RunTreeTracker {
 			handleToolStart: this.guarded(
 				'handleToolStart',
 				(args) => ({ runId: args[2] as string, parentRunId: args[3] as string | undefined }),
-				(tool, input, runId, parentRunId) =>
-					this.openRun(runId, parentRunId, `tool:${this.componentName(tool)}`, SPAN_KIND_INTERNAL, {
-						'tool.input': this.config.captureToolIO ? this.truncate(this.safeStringify(input)) : undefined,
-					}),
+				(tool, input, runId, parentRunId) => {
+					const toolName = this.componentName(tool);
+					this.openRun(runId, parentRunId, `execute_tool ${toolName}`, SPAN_KIND_INTERNAL, {
+						'gen_ai.operation.name': 'execute_tool',
+						'gen_ai.tool.name': toolName,
+						'gen_ai.tool.type': 'function',
+						'lk.function_tool.name': toolName,
+						'gen_ai.tool.call.arguments': this.config.captureToolIO
+							? this.truncate(this.safeStringify(input))
+							: undefined,
+					});
+				},
 			),
 			handleToolEnd: this.guarded(
 				'handleToolEnd',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
 				(output, runId) =>
 					this.closeRun(runId, {
-						'tool.output': this.config.captureToolIO
+						'gen_ai.tool.call.result': this.config.captureToolIO
 							? this.truncate(this.safeStringify(output))
 							: undefined,
 					}),

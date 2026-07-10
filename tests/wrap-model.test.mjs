@@ -19,7 +19,10 @@ const OPTIONS = {
 	redactionPatterns: [],
 };
 
-const CREDENTIAL = { endpointUrl: 'http://opik.local/api/v1/private/otel', authType: 'customHeaders' };
+const CREDENTIAL = {
+	endpointUrl: 'http://opik.local/api/v1/private/otel',
+	authType: 'customHeaders',
+};
 
 // NOTE: wrapModelWithTracing keeps a module-level pipeline registry keyed on
 // (executionId, node name), so every test must use a UNIQUE execution id to
@@ -54,7 +57,7 @@ test('attachHandler PREPENDS to an existing callbacks array without clobbering',
 	// Order is load-bearing: n8n's own N8nLlmTracing handler MUTATES the
 	// shared LLMResult in handleLLMEnd (strips `message` from generations);
 	// running first is the only way to see tool_calls/usage_metadata.
-	assert.equal(model.callbacks[0], mine, 'our handler runs before n8n\'s mutating one');
+	assert.equal(model.callbacks[0], mine, "our handler runs before n8n's mutating one");
 	assert.equal(model.callbacks[1], existing);
 });
 
@@ -76,7 +79,15 @@ test('handler ordering end-to-end: a mutating co-handler (N8nLlmTracing shape) c
 	ours.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-mut');
 	const output = {
 		generations: [
-			[{ text: '', message: { tool_calls: [{ id: 'c1', name: 'calculator', args: { input: '1+1' } }], usage_metadata: { input_tokens: 11, output_tokens: 3 } } }],
+			[
+				{
+					text: '',
+					message: {
+						tool_calls: [{ id: 'c1', name: 'calculator', args: { input: '1+1' } }],
+						usage_metadata: { input_tokens: 11, output_tokens: 3 },
+					},
+				},
+			],
 		],
 		llmOutput: {},
 	};
@@ -89,7 +100,10 @@ test('handler ordering end-to-end: a mutating co-handler (N8nLlmTracing shape) c
 	const llm = spans.find((s) => s.name.startsWith('llm:'));
 	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
 	assert.equal(attrs['gen_ai.usage.input_tokens'], '11', 'usage read before the mutation');
-	assert.ok(String(attrs['gen_ai.tool_calls']).includes('calculator'), 'tool_calls read before the mutation');
+	assert.ok(
+		String(attrs['gen_ai.output.messages']).includes('calculator'),
+		'tool_calls read before the mutation',
+	);
 });
 
 test('attachHandler is idempotent for arrays: re-attaching the same handler does not double it', () => {
@@ -123,7 +137,11 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	const model = { callbacks: [] };
 	const returned = wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
 	assert.equal(returned.model, model);
-	assert.equal(typeof returned.closeFunction, 'function', 'registry-backed wrap returns a closeFunction');
+	assert.equal(
+		typeof returned.closeFunction,
+		'function',
+		'registry-backed wrap returns a closeFunction',
+	);
 	assert.equal(model.callbacks.length, 1);
 
 	const handler = model.callbacks[0];
@@ -133,20 +151,29 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 		'run-1',
 		'agent-run',
 	);
-	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 4, completionTokens: 2 } } }, 'run-1');
+	handler.handleLLMEnd(
+		{
+			generations: [[{ text: 'answer' }]],
+			llmOutput: { tokenUsage: { promptTokens: 4, completionTokens: 2 } },
+		},
+		'run-1',
+	);
 	await flushMicrotasks();
 	await flushMicrotasks();
 
-	// synthetic root flushes first, then the llm span (Opik 409 semantics)
+	// Child-first is intentional: the root closes after the final answer so it
+	// can carry correct trace input/output and duration.
 	const allSpans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
 	assert.equal(allSpans.length, 2);
 	assert.equal(httpCalls[0].method, 'POST');
 	assert.equal(httpCalls[0].url, 'http://opik.local/api/v1/private/otel/v1/traces');
-	const [rootSpan, exportedSpan] = allSpans;
+	const [exportedSpan, rootSpan] = allSpans;
 	assert.equal(rootSpan.name, 'spike', 'root named after the Trace Name option');
 	assert.equal(exportedSpan.parentSpanId, rootSpan.spanId);
 	assert.equal(exportedSpan.traceId, rootSpan.traceId);
-	const attrs = Object.fromEntries(exportedSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
+	const attrs = Object.fromEntries(
+		exportedSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]),
+	);
 	assert.equal(attrs['n8n.workflow.id'], 'wf-9');
 	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
 	assert.equal(attrs['session.id'], 'sess-1');
@@ -228,16 +255,20 @@ test('one execution shares one pipeline: spans from separate wrap calls share a 
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-shared'), modelB, OPTIONS, CREDENTIAL);
 	assert.equal(modelA.callbacks[0], modelB.callbacks[0], 'same handler reused for one execution');
 	modelA.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-a');
-	modelA.callbacks[0].handleLLMEnd({}, 'run-a');
+	modelA.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer-a' }]] }, 'run-a');
 	modelB.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-b');
-	modelB.callbacks[0].handleLLMEnd({}, 'run-b');
+	modelB.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer-b' }]] }, 'run-b');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
 	// synthetic root + 2 llm spans, all in one trace
 	assert.equal(spans.length, 3);
-	assert.ok(spans.every((s) => s.traceId === spans[0].traceId), 'one execution -> one trace');
-	const [root, llm1, llm2] = spans;
+	assert.ok(
+		spans.every((s) => s.traceId === spans[0].traceId),
+		'one execution -> one trace',
+	);
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	const [llm1, llm2] = spans.filter((span) => span.name.startsWith('llm:'));
 	assert.equal(llm1.parentSpanId, root.spanId);
 	assert.equal(llm2.parentSpanId, root.spanId);
 	assert.notEqual(llm1.spanId, llm2.spanId);
@@ -251,9 +282,9 @@ test('different executions get different pipelines and traces', async () => {
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-two'), modelB, OPTIONS, CREDENTIAL);
 	assert.notEqual(modelA.callbacks[0], modelB.callbacks[0]);
 	modelA.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-a');
-	modelA.callbacks[0].handleLLMEnd({}, 'run-a');
+	modelA.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer-a' }]] }, 'run-a');
 	modelB.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-b');
-	modelB.callbacks[0].handleLLMEnd({}, 'run-b');
+	modelB.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer-b' }]] }, 'run-b');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
@@ -267,42 +298,46 @@ test('root re-emits with the SAME spanId after its export batch fails, so late-a
 	const httpCalls = [];
 	let callCount = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry');
-	// The synthetic root always ships as its own solo batch first; fail only
-	// that first POST, then let every later batch succeed.
+	// The final root ships after its child; fail only that second POST, then
+	// let every later batch succeed.
 	ctx.helpers.httpRequest = async (options) => {
 		callCount++;
 		httpCalls.push(options);
-		if (callCount === 1) throw new Error('backend down for the root batch');
+		if (callCount === 2) throw new Error('backend down for the root batch');
 	};
 
 	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, CREDENTIAL);
 	const handler = model.callbacks[0];
 
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
-	handler.handleLLMEnd({}, 'run-1');
+	handler.handleLLMEnd({ generations: [[{ text: 'answer-1' }]] }, 'run-1');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
-	// A second LLM span's closeRun is what re-triggers emitSharedRootIfNeeded.
+	// A later final answer retries the failed root after exporting its child.
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-2');
-	handler.handleLLMEnd({}, 'run-2');
+	handler.handleLLMEnd({ generations: [[{ text: 'answer-2' }]] }, 'run-2');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodies.length, 4, 'four POSTs: failed root, llm-1, re-emitted root, llm-2');
+	assert.equal(bodies.length, 4, 'four POSTs: llm-1, failed root, llm-2, re-emitted root');
 
-	const [failedRoot] = bodies[0];
-	const [llm1] = bodies[1];
-	const [reEmittedRoot] = bodies[2];
-	const [llm2] = bodies[3];
+	const [llm1] = bodies[0];
+	const [failedRoot] = bodies[1];
+	const [llm2] = bodies[2];
+	const [reEmittedRoot] = bodies[3];
 
 	assert.equal(failedRoot.parentSpanId, undefined, 'the root span itself has no parent');
 	assert.equal(reEmittedRoot.spanId, failedRoot.spanId, 'retry re-emits the SAME root spanId');
 	assert.equal(reEmittedRoot.traceId, failedRoot.traceId);
-	assert.equal(llm1.parentSpanId, reEmittedRoot.spanId, 'llm-1 already referenced the (retried) root spanId');
+	assert.equal(
+		llm1.parentSpanId,
+		reEmittedRoot.spanId,
+		'llm-1 already referenced the (retried) root spanId',
+	);
 	assert.equal(llm2.parentSpanId, reEmittedRoot.spanId, 'llm-2 parented to the same root spanId');
 	// Final state: the backend actually received the root (batch 3 succeeded)
 	// with the exact spanId both children point to as their parent.
@@ -312,12 +347,12 @@ test('a 409 on the root batch does NOT re-emit: the backend already has the root
 	const httpCalls = [];
 	let callCount = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-409');
-	// The solo root batch "fails" with a 409 — Opik answering "Trace already
+	// The root batch "fails" with a 409 — Opik answering "Trace already
 	// exists", e.g. after a client-side timeout on a POST the server ingested.
 	ctx.helpers.httpRequest = async (options) => {
 		callCount++;
 		httpCalls.push(options);
-		if (callCount === 1) {
+		if (callCount === 2) {
 			// n8n NodeApiError shape: httpCode is a string
 			throw Object.assign(new Error('Conflict'), { httpCode: '409' });
 		}
@@ -327,21 +362,28 @@ test('a 409 on the root batch does NOT re-emit: the backend already has the root
 	const handler = model.callbacks[0];
 
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
-	handler.handleLLMEnd({}, 'run-1');
+	handler.handleLLMEnd({ generations: [[{ text: 'answer-1' }]] }, 'run-1');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-2');
-	handler.handleLLMEnd({}, 'run-2');
+	handler.handleLLMEnd({ generations: [[{ text: 'answer-2' }]] }, 'run-2');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodies.length, 3, 'three POSTs: 409ed root, llm-1, llm-2 — NO re-emitted root batch');
-	const rootSpanId = bodies[0][0].spanId;
-	const laterSpanIds = bodies.slice(1).flat().map((s) => s.spanId);
+	assert.equal(
+		bodies.length,
+		3,
+		'three POSTs: llm-1, 409ed root, llm-2 — NO re-emitted root batch',
+	);
+	const rootSpanId = bodies[1][0].spanId;
+	const laterSpanIds = bodies
+		.slice(2)
+		.flat()
+		.map((s) => s.spanId);
 	assert.ok(!laterSpanIds.includes(rootSpanId), 'no later batch carries a re-emitted root');
 });
 
@@ -367,20 +409,29 @@ test('non-numeric Max Payload Size falls back to the 32 KB default budget instea
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
 	const llm = spans.find((s) => s.name.startsWith('llm:'));
 	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
-	assert.ok(String(attrs['gen_ai.prompt']).includes('short prompt'), 'prompt captured under the default budget');
-	assert.ok(!String(attrs['gen_ai.prompt']).includes('[truncated]'), 'a NaN budget must not truncate everything');
-	assert.equal(attrs['gen_ai.completion'], 'short answer', 'completion untouched too');
+	assert.ok(
+		String(attrs['gen_ai.input.messages']).includes('short prompt'),
+		'prompt captured under the default budget',
+	);
+	assert.ok(
+		!String(attrs['gen_ai.input.messages']).includes('[truncated]'),
+		'a NaN budget must not truncate everything',
+	);
+	assert.ok(
+		String(attrs['gen_ai.output.messages']).includes('short answer'),
+		'completion untouched too',
+	);
 });
 
 test('single-closeRun execution: closeFunction retries the failed root at execution end (and still evicts)', async () => {
 	const httpCalls = [];
 	let callCount = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry-at-close');
-	// Fail ONLY the solo root batch; the child batch and the retry succeed.
+	// Fail ONLY the root batch (which follows its child); the retry succeeds.
 	ctx.helpers.httpRequest = async (options) => {
 		callCount++;
 		httpCalls.push(options);
-		if (callCount === 1) throw new Error('backend down for the root batch');
+		if (callCount === 2) throw new Error('backend down for the root batch');
 	};
 
 	const modelA = { callbacks: [] };
@@ -390,38 +441,60 @@ test('single-closeRun execution: closeFunction retries the failed root at execut
 	// Exactly ONE LLM call: no later closeRun ever re-triggers the root emit,
 	// so without the execution-end retry the trace stays orphaned forever.
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-only');
-	handler.handleLLMEnd({}, 'run-only');
+	handler.handleLLMEnd({ generations: [[{ text: 'answer' }]] }, 'run-only');
 	await flushMicrotasks();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	const bodiesBeforeClose = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodiesBeforeClose.length, 2, 'before closeFunction: only failed root + child were POSTed');
+	assert.equal(
+		bodiesBeforeClose.length,
+		2,
+		'before closeFunction: child + failed root were POSTed',
+	);
 
 	await closeFunction();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodies.length, 3, 'three POSTs: failed root, child, root retried at execution end');
-	const [failedRoot] = bodies[0];
-	const [child] = bodies[1];
+	assert.equal(bodies.length, 3, 'three POSTs: child, failed root, root retried at execution end');
+	const [child] = bodies[0];
+	const [failedRoot] = bodies[1];
 	const [retriedRoot] = bodies[2];
-	assert.equal(retriedRoot.spanId, failedRoot.spanId, 'execution-end retry re-emits the SAME root spanId');
+	assert.equal(
+		retriedRoot.spanId,
+		failedRoot.spanId,
+		'execution-end retry re-emits the SAME root spanId',
+	);
 	assert.equal(retriedRoot.parentSpanId, undefined, 'the retried root is still parentless');
-	assert.equal(child.parentSpanId, retriedRoot.spanId, "child's parentSpanId matches the root the backend finally got");
+	assert.equal(
+		child.parentSpanId,
+		retriedRoot.spanId,
+		"child's parentSpanId matches the root the backend finally got",
+	);
 
 	// closeFunction does NOT evict (the steppable Tools Agent fires it after
 	// every step): same executionId keeps the SAME pipeline.
 	const modelB = { callbacks: [] };
-	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-root-retry-at-close'), modelB, OPTIONS, CREDENTIAL);
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-root-retry-at-close'),
+		modelB,
+		OPTIONS,
+		CREDENTIAL,
+	);
 	assert.equal(modelB.callbacks[0], handler, 'the registry entry survives closeFunction');
 });
 
 test('closeFunction keeps the pipeline (V3 steps); the lazy sweep evicts it after the linger window', async () => {
 	const httpCalls = [];
 	const modelA = { callbacks: [] };
-	const { closeFunction } = wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelA, OPTIONS, CREDENTIAL);
+	const { closeFunction } = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-close'),
+		modelA,
+		OPTIONS,
+		CREDENTIAL,
+	);
 	assert.equal(typeof closeFunction, 'function');
 	const handlerA = modelA.callbacks[0];
 
@@ -444,7 +517,11 @@ test('closeFunction keeps the pipeline (V3 steps); the lazy sweep evicts it afte
 	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
 	const modelD = { callbacks: [] };
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelD, OPTIONS, CREDENTIAL);
-	assert.notEqual(modelD.callbacks[0], handlerA, 'a lingering closed entry is finalized and evicted');
+	assert.notEqual(
+		modelD.callbacks[0],
+		handlerA,
+		'a lingering closed entry is finalized and evicted',
+	);
 });
 
 test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace with a matched tool span', async () => {
@@ -460,7 +537,12 @@ test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace
 	handler.handleLLMEnd(
 		{
 			generations: [
-				[{ text: '', message: { tool_calls: [{ id: 'call-1', name: 'calculator', args: { input: '2+2' } }] } }],
+				[
+					{
+						text: '',
+						message: { tool_calls: [{ id: 'call-1', name: 'calculator', args: { input: '2+2' } }] },
+					},
+				],
 			],
 		},
 		'run-1',
@@ -471,7 +553,7 @@ test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace
 	await flushMicrotasks();
 	const afterClose = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
 	assert.ok(
-		!afterClose.some((s) => s.name.startsWith('tool:')),
+		!afterClose.some((s) => s.name.startsWith('execute_tool ')),
 		'a step-end close must not flush the pending tool call — its result is still coming',
 	);
 
@@ -493,17 +575,31 @@ test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace
 	assert.equal(traceIds.size, 1, 'both steps land in ONE trace');
 	const parentless = spans.filter((s) => s.parentSpanId === undefined);
 	assert.equal(parentless.length, 1, 'exactly one root across the whole execution');
-	const toolSpan = spans.find((s) => s.name === 'tool:calculator');
+	const toolSpan = spans.find((s) => s.name === 'execute_tool calculator');
 	assert.ok(toolSpan, 'the tool call requested in step 1 is synthesized after step 2');
-	const attrs = Object.fromEntries(toolSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
-	assert.equal(attrs['tool.output'], '4', 'the step-2 tool result was matched across the close boundary');
-	assert.ok(!('n8n.tool.result_observed' in attrs), 'a matched tool span carries no unmatched marker');
+	const attrs = Object.fromEntries(
+		toolSpan.attributes.map((a) => [a.key, Object.values(a.value)[0]]),
+	);
+	assert.equal(
+		attrs['gen_ai.tool.call.result'],
+		'4',
+		'the step-2 tool result was matched across the close boundary',
+	);
+	assert.ok(
+		!('n8n.tool.result_observed' in attrs),
+		'a matched tool span carries no unmatched marker',
+	);
 	assert.equal(spans.filter((s) => s.name.startsWith('llm:')).length, 2, 'both LLM calls present');
 });
 
 test('closeFunction is idempotent: calling it more than once never throws', async () => {
 	const model = { callbacks: [] };
-	const { closeFunction } = wrapModelWithTracing(fakeCtx([], [], 'exec-close-2'), model, OPTIONS, CREDENTIAL);
+	const { closeFunction } = wrapModelWithTracing(
+		fakeCtx([], [], 'exec-close-2'),
+		model,
+		OPTIONS,
+		CREDENTIAL,
+	);
 	await closeFunction();
 	await assert.doesNotReject(closeFunction());
 });

@@ -20,10 +20,10 @@ parameter:
 
 ```
 trace "support-agent-run"
-├─ support-agent-run                 (root)
-├─ llm:claude-sonnet-4-6   683 tok   prompt: [{"role":"human","content":"…"}]
-├─ tool:calculator                   input: "2 × 81672"  output: "163344"
-└─ llm:claude-sonnet-4-6   791 tok   completion: "The result of **2 × 81,672 = 163,344**."
+├─ support-agent-run                 input: "…"  output: "The result is 163344"
+├─ llm:claude-sonnet-4-6   683 tok   input messages: [{"role":"user","parts":[…]}]
+├─ execute_tool calculator           arguments: "2 × 81672"  result: "163344"
+└─ llm:claude-sonnet-4-6   791 tok   output messages: [{"role":"assistant","parts":[…]}]
 ```
 
 Spans use OTel GenAI semantic-convention attributes; backends that map them
@@ -91,9 +91,12 @@ decisions. All spans carry n8n context (`n8n.workflow.id/name`,
 
 Tool *executions* (the actual Calculator/HTTP/etc. runs between LLM calls) are
 not visible to a model-attached tracer in n8n's current architecture.
-`tool:<name>` spans are therefore reconstructed from what does pass through
-the model: the tool calls the model requested, matched to the results echoed
-back in the next model call (marked `n8n.span.synthesized: true`). Their
+`execute_tool <name>` spans are therefore reconstructed from what does pass
+through the model: the tool calls the model requested, matched to the results
+echoed back in the next model call. This includes n8n V3's fallback
+`Calling <tool> with input: <JSON>` message when a provider callback omits
+structured `tool_calls` (all reconstructed spans are marked
+`n8n.span.synthesized: true`). Their
 timing is derived from the surrounding LLM-call boundaries and includes n8n
 framework overhead, not pure tool runtime. A tool whose result never reaches a
 later model call (e.g. an error mid-tool) is still emitted at execution end,
