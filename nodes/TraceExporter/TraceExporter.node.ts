@@ -7,7 +7,37 @@ import {
 } from 'n8n-workflow';
 
 import type { OtlpCredential } from './shared/otlpExport';
-import { wrapModelWithTracing, type TraceExporterOptions } from './shared/wrapModelWithTracing';
+import { createExecutionStateHandler } from './shared/n8nExecutionState';
+import type { ExecutionStateHandler } from './shared/n8nExecutionState';
+import {
+	attachHandler,
+	wrapModelWithTracing,
+	type TraceExporterOptions,
+} from './shared/wrapModelWithTracing';
+
+/**
+ * A model instance can be reused across steppable-agent supplyData calls.
+ * Replace that model's prior step-local UI handler instead of accumulating
+ * callbacks bound to stale ISupplyDataFunctions contexts.
+ */
+function attachExecutionStateHandler(model: unknown, handler: ExecutionStateHandler): boolean {
+	if (model && typeof model === 'object') {
+		const callbacks = (model as { callbacks?: unknown }).callbacks;
+		if (Array.isArray(callbacks)) {
+			const existingIndex = callbacks.findIndex(
+				(candidate) =>
+					candidate !== null &&
+					typeof candidate === 'object' &&
+					(candidate as { name?: unknown }).name === handler.name,
+			);
+			if (existingIndex >= 0) {
+				callbacks[existingIndex] = handler;
+				return true;
+			}
+		}
+	}
+	return attachHandler(model, handler);
+}
 
 /**
  * Trace Exporter — the core innovation of this package (PRD §5 "Node A").
@@ -130,6 +160,14 @@ export class TraceExporter implements INodeType {
 						description: 'Whether to include tool call inputs/outputs in exported spans. Off by default for the same privacy reason as prompt/completion capture.',
 					},
 					{
+						displayName: 'Environment',
+						name: 'environment',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. production',
+						description: 'Deployment environment used to filter and compare traces',
+					},
+					{
 						displayName: 'Max Payload Size (KB)',
 						name: 'maxPayloadSizeKb',
 						type: 'number',
@@ -142,8 +180,16 @@ export class TraceExporter implements INodeType {
 						type: 'string',
 						typeOptions: { multipleValues: true },
 						default: [],
-						placeholder: 'e.g. \\b\\d{16}\\b or $.customer.email',
-						description: 'Regex or JSONPath patterns applied to captured payloads before export; matches are redacted (PRD §5, enterprise ask: "sensitive data exposed in logs")',
+						placeholder: 'e.g. \\b\\d{16}\\b or /secret-[a-z0-9]+/gi',
+						description: 'JavaScript regular expressions applied to every captured payload, error, tag, and metadata value before export; matches become [REDACTED]',
+					},
+					{
+						displayName: 'Release',
+						name: 'release',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. 2026.07.10',
+						description: 'Application release or deployment version attached to traces',
 					},
 					{
 						displayName: 'Sampling Rate (%)',
@@ -152,6 +198,22 @@ export class TraceExporter implements INodeType {
 						typeOptions: { minValue: 0, maxValue: 100 },
 						default: 100,
 						description: 'Percentage of traces to export; the rest are dropped before ever leaving the process (PRD §5 "Sampling rate (0-100%)")',
+					},
+					{
+						displayName: 'Service Name',
+						name: 'serviceName',
+						type: 'string',
+						default: 'n8n',
+						description: 'OpenTelemetry service.name resource attribute',
+					},
+					{
+						displayName: 'Tags',
+						name: 'tags',
+						type: 'string',
+						typeOptions: { multipleValues: true },
+						default: [],
+						placeholder: 'e.g. support or experiment-a',
+						description: 'Searchable labels attached to every span and trace',
 					},
 				],
 			},
@@ -172,6 +234,30 @@ export class TraceExporter implements INodeType {
 		// nothing).
 		const supplied = await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, itemIndex);
 		const model = Array.isArray(supplied) ? (supplied[0] as unknown) : supplied;
+		const traceContextBox: {
+			current?: () => { traceId: string; rootSpanId: string } | undefined;
+		} = {};
+		// `supplyData()` itself does not create run data in n8n. A fresh,
+		// step-local callback reports model start/end/error through
+		// addInputData/addOutputData so the Trace Exporter appears executed
+		// (green) just like n8n's built-in Model Selector middleware. Attach it
+		// before the execution-wide OTLP handler below; the latter prepends
+		// itself and therefore still reads provider output before n8n's core
+		// callback mutates it.
+		try {
+			if (
+				!attachExecutionStateHandler(
+					model,
+					createExecutionStateHandler(this, () => traceContextBox.current?.()),
+				)
+			) {
+				this.logger.warn(
+					'[TraceExporter] could not attach n8n execution-state reporting to the supplied model',
+				);
+			}
+		} catch {
+			// UI execution state is best-effort and must never block model passthrough.
+		}
 
 		const options = this.getNodeParameter('options', itemIndex, {}) as {
 			capturePrompts?: boolean;
@@ -179,6 +265,10 @@ export class TraceExporter implements INodeType {
 			maxPayloadSizeKb?: number;
 			samplingRatePercent?: number;
 			redactionPatterns?: string[];
+			environment?: string;
+			tags?: string[];
+			release?: string;
+			serviceName?: string;
 		};
 
 		const traceExporterOptions: TraceExporterOptions = {
@@ -191,6 +281,11 @@ export class TraceExporter implements INodeType {
 			maxPayloadSizeKb: options.maxPayloadSizeKb ?? 32,
 			samplingRatePercent: options.samplingRatePercent ?? 100,
 			redactionPatterns: options.redactionPatterns ?? [],
+			environment: options.environment ?? '',
+			tags: options.tags ?? [],
+			release: options.release ?? '',
+			serviceName: options.serviceName ?? 'n8n',
+			itemIndex,
 		};
 
 		const credential = (await this.getCredentials(
@@ -198,12 +293,13 @@ export class TraceExporter implements INodeType {
 			itemIndex,
 		)) as unknown as OtlpCredential;
 
-		const { model: wrappedModel, closeFunction } = wrapModelWithTracing(
+		const { model: wrappedModel, closeFunction, getTraceContext } = wrapModelWithTracing(
 			this,
 			model,
 			traceExporterOptions,
 			credential,
 		);
+		traceContextBox.current = getTraceContext;
 
 		return closeFunction ? { response: wrappedModel, closeFunction } : { response: wrappedModel };
 	}

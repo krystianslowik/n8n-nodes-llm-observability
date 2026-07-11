@@ -8,6 +8,7 @@ import {
 	completionTextFrom,
 	genAiSystemFrom,
 	modelNameFrom,
+	responseDetailsFrom,
 	tokenUsageFrom,
 	toolCallsFrom,
 } from './genAiAttributes';
@@ -36,6 +37,8 @@ export interface TrackerConfig {
 	samplingRatePercent: number;
 	/** n8n context + session/user/metadata, stamped on every span (PRD F3/F4). */
 	baseAttributes: Record<string, OtlpAttrValue>;
+	/** Sanitizes every captured string before it leaves the process. */
+	redact?: (text: string) => string;
 	/** Injectable clock for tests. */
 	now?: () => number;
 	/** Fires per hook invocation — the live run logs these lines; they ARE the capture-depth measurement. */
@@ -157,6 +160,7 @@ export class RunTreeTracker {
 		/** Un-latches granted so far; capped at MAX_ROOT_RE_EMITS. */
 		rootReEmits: number;
 		sampled: boolean;
+		error?: { type: string; message: string };
 	};
 
 	private readonly startedAtMs: number;
@@ -209,6 +213,15 @@ export class RunTreeTracker {
 		return { traceId: this.sharedTrace.traceId, sampled: this.sharedTrace.sampled };
 	}
 
+	/** Public correlation IDs for n8n execution data; never creates a trace. */
+	getTraceContext(): { traceId: string; rootSpanId: string } | undefined {
+		if (!this.sharedTrace) return undefined;
+		return {
+			traceId: this.sharedTrace.traceId,
+			rootSpanId: this.sharedTrace.rootSpanId,
+		};
+	}
+
 	/**
 	 * Emit the shared trace's synthetic root once the final model answer is
 	 * known. Child spans are deliberately allowed to export first: live Opik
@@ -243,9 +256,31 @@ export class RunTreeTracker {
 			endTimeUnixNano: msToNanos(shared.endMs ?? this.now()),
 			attributes: toOtlpAttributes({
 				...this.config.baseAttributes,
+				'gen_ai.operation.name': 'invoke_agent',
+				'gen_ai.agent.name': this.config.rootSpanName ?? 'n8n agent execution',
+				'langfuse.observation.type': 'agent',
+				'langfuse.trace.input': shared.input,
+				'langfuse.trace.output': shared.output,
+				'langfuse.observation.input': shared.input,
+				'langfuse.observation.output': shared.output,
 				input: shared.input,
 				output: shared.output,
 			}),
+			...(shared.error
+				? {
+						status: { code: STATUS_ERROR, message: shared.error.message },
+						events: [
+							{
+								timeUnixNano: msToNanos(shared.endMs ?? this.now()),
+								name: 'exception',
+								attributes: toOtlpAttributes({
+									'exception.type': shared.error.type,
+									'exception.message': shared.error.message,
+								}),
+							},
+						],
+					}
+				: {}),
 		});
 	}
 
@@ -350,6 +385,7 @@ export class RunTreeTracker {
 		runId: string,
 		endAttributes: Record<string, OtlpAttrValue | undefined>,
 		status?: { code: number; message?: string },
+		exception?: { type: string; message: string },
 	): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
@@ -359,6 +395,7 @@ export class RunTreeTracker {
 		if (this.sharedTrace && run.traceId === this.sharedTrace.traceId) {
 			parentSpanId = parentSpanId ?? this.sharedTrace.rootSpanId;
 		}
+		const endMs = this.now();
 		this.emit({
 			traceId: run.traceId,
 			spanId: run.spanId,
@@ -366,13 +403,27 @@ export class RunTreeTracker {
 			name: run.name,
 			kind: run.kind,
 			startTimeUnixNano: msToNanos(run.startMs),
-			endTimeUnixNano: msToNanos(this.now()),
+			endTimeUnixNano: msToNanos(endMs),
 			attributes: toOtlpAttributes({
 				...this.config.baseAttributes,
 				...run.attributes,
 				...endAttributes,
 			}),
 			...(status ? { status } : {}),
+			...(exception
+				? {
+						events: [
+							{
+								timeUnixNano: msToNanos(endMs),
+								name: 'exception',
+								attributes: toOtlpAttributes({
+									'exception.type': exception.type,
+									'exception.message': exception.message,
+								}),
+							},
+						],
+					}
+				: {}),
 		});
 	}
 
@@ -409,6 +460,39 @@ export class RunTreeTracker {
 				? low - 1
 				: low;
 		return `${text.slice(0, end)}${TRUNCATION_MARKER}`;
+	}
+
+	private sanitize(text: string): string {
+		let sanitized = text;
+		try {
+			sanitized = this.config.redact?.(text) ?? text;
+		} catch {
+			this.handlerErrors++;
+		}
+		return this.truncate(sanitized);
+	}
+
+	private errorMessage(error: unknown): string {
+		let message = 'Unknown error';
+		try {
+			message = String(error);
+		} catch {
+			/* hostile error coercion — keep the safe fallback */
+		}
+		return this.sanitize(message).slice(0, 500);
+	}
+
+	private exceptionDetails(error: unknown): { type: string; message: string } {
+		let type = 'Error';
+		try {
+			if (error && typeof error === 'object') {
+				const name = (error as { name?: unknown }).name;
+				if (typeof name === 'string' && name.length > 0) type = name;
+			}
+		} catch {
+			/* best-effort error classification */
+		}
+		return { type: this.sanitize(type).slice(0, 200), message: this.errorMessage(error) };
 	}
 
 	private safeStringify(value: unknown): string {
@@ -526,20 +610,45 @@ export class RunTreeTracker {
 	): void {
 		const serialized = llm ?? undefined;
 		const model = modelNameFrom(serialized, extraParams);
+		const invocationParams = extraParams?.invocation_params as Record<string, unknown> | undefined;
+		const numberParam = (...names: string[]): number | undefined => {
+			const name = names.find((candidate) => invocationParams?.[candidate] !== undefined);
+			const value = name ? invocationParams?.[name] : undefined;
+			return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+		};
+		const stop = invocationParams?.stop;
+		const stopSequences = Array.isArray(stop)
+			? stop.filter((entry): entry is string => typeof entry === 'string')
+			: typeof stop === 'string'
+				? [stop]
+				: undefined;
 		const capturedInput =
 			this.config.capturePrompts && promptText !== undefined
-				? this.truncate(promptText)
+				? this.sanitize(promptText)
 				: undefined;
 		this.openRun(
 			runId,
 			parentRunId,
-			`llm:${model ?? this.componentName(serialized)}`,
+			`chat ${model ?? this.componentName(serialized)}`,
 			SPAN_KIND_CLIENT,
 			{
+				'gen_ai.provider.name': genAiSystemFrom(serialized),
+				// Deprecated OTel key retained for backends that have not migrated.
 				'gen_ai.system': genAiSystemFrom(serialized),
 				'gen_ai.operation.name': 'chat',
 				'gen_ai.request.model': model,
+				'gen_ai.request.temperature': numberParam('temperature'),
+				'gen_ai.request.max_tokens': numberParam('max_tokens', 'maxTokens'),
+				'gen_ai.request.top_p': numberParam('top_p', 'topP'),
+				'gen_ai.request.frequency_penalty': numberParam(
+					'frequency_penalty',
+					'frequencyPenalty',
+				),
+				'gen_ai.request.presence_penalty': numberParam('presence_penalty', 'presencePenalty'),
+				'gen_ai.request.stop_sequences': stopSequences,
 				'gen_ai.input.messages': capturedInput,
+				'langfuse.observation.type': 'generation',
+				'langfuse.observation.input': capturedInput,
 			},
 		);
 		if (this.config.singleTrace && capturedInput !== undefined) {
@@ -553,6 +662,7 @@ export class RunTreeTracker {
 	private closeLlmRun(output: LlmResultLike | null, runId: string): void {
 		const result = output ?? {};
 		const usage = tokenUsageFrom(result);
+		const response = responseDetailsFrom(result);
 		const completion = completionTextFrom(result);
 		// Tool executions never reach a model-attached handler (measured live),
 		// but the model's own response names the tools it decided to call.
@@ -587,10 +697,15 @@ export class RunTreeTracker {
 			toolCalls,
 		);
 		this.closeRun(runId, {
+			'gen_ai.response.id': response.id,
+			'gen_ai.response.model': response.model,
+			'gen_ai.response.finish_reasons': response.finishReasons,
 			'gen_ai.usage.input_tokens': usage.inputTokens,
 			'gen_ai.usage.output_tokens': usage.outputTokens,
 			'gen_ai.output.messages':
-				serializedOutput === undefined ? undefined : this.truncate(serializedOutput),
+				serializedOutput === undefined ? undefined : this.sanitize(serializedOutput),
+			'langfuse.observation.output':
+				serializedOutput === undefined ? undefined : this.sanitize(serializedOutput),
 		});
 		// A non-empty model answer with no requested tools is the successful end
 		// of the normal V3 agent loop. Tool-only responses have empty text, so a
@@ -600,7 +715,7 @@ export class RunTreeTracker {
 			if (this.sharedTrace) {
 				this.sharedTrace.endMs = endedAtMs;
 				this.sharedTrace.output = this.config.capturePrompts
-					? this.truncate(completion)
+					? this.sanitize(completion)
 					: undefined;
 			}
 			this.emitSharedRootIfNeeded();
@@ -609,10 +724,14 @@ export class RunTreeTracker {
 
 	private closeLlmError(error: unknown, runId: string): void {
 		const endedAtMs = this.now();
-		this.closeRun(runId, {}, { code: STATUS_ERROR, message: String(error).slice(0, 500) });
+		const exception = this.exceptionDetails(error);
+		this.closeRun(runId, {}, { code: STATUS_ERROR, message: exception.message }, exception);
 		if (!this.config.singleTrace) return;
 		this.sharedTraceContext();
-		if (this.sharedTrace) this.sharedTrace.endMs = endedAtMs;
+		if (this.sharedTrace) {
+			this.sharedTrace.endMs = endedAtMs;
+			this.sharedTrace.error = exception;
+		}
 		this.emitSharedRootIfNeeded();
 	}
 
@@ -753,6 +872,7 @@ export class RunTreeTracker {
 			endTimeUnixNano: msToNanos(result.endMs ?? this.now()),
 			attributes: toOtlpAttributes({
 				...this.config.baseAttributes,
+				'langfuse.observation.type': 'tool',
 				'gen_ai.operation.name': 'execute_tool',
 				'gen_ai.tool.name': toolName,
 				'gen_ai.tool.type': 'function',
@@ -766,11 +886,11 @@ export class RunTreeTracker {
 				'n8n.tool.result_observed': result.resultObserved ? undefined : false,
 				'gen_ai.tool.call.arguments':
 					this.config.captureToolIO && pending.args !== undefined
-						? this.truncate(this.safeStringify(pending.args))
+						? this.sanitize(this.safeStringify(pending.args))
 						: undefined,
 				'gen_ai.tool.call.result':
 					this.config.captureToolIO && result.resultObserved
-						? this.truncate(this.safeStringify(result.output))
+						? this.sanitize(this.safeStringify(result.output))
 						: undefined,
 			}),
 		});
@@ -874,7 +994,7 @@ export class RunTreeTracker {
 						parentRunId,
 						`chain:${this.componentName(chain)}`,
 						SPAN_KIND_INTERNAL,
-						{},
+						{ 'langfuse.observation.type': 'chain' },
 					),
 			),
 			handleChainEnd: this.guarded(
@@ -886,7 +1006,12 @@ export class RunTreeTracker {
 				'handleChainError',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
 				(error, runId) =>
-					this.closeRun(runId, {}, { code: STATUS_ERROR, message: String(error).slice(0, 500) }),
+					this.closeRun(
+						runId,
+						{},
+						{ code: STATUS_ERROR, message: this.errorMessage(error) },
+						this.exceptionDetails(error),
+					),
 			),
 			handleToolStart: this.guarded(
 				'handleToolStart',
@@ -894,12 +1019,13 @@ export class RunTreeTracker {
 				(tool, input, runId, parentRunId) => {
 					const toolName = this.componentName(tool);
 					this.openRun(runId, parentRunId, `execute_tool ${toolName}`, SPAN_KIND_INTERNAL, {
+						'langfuse.observation.type': 'tool',
 						'gen_ai.operation.name': 'execute_tool',
 						'gen_ai.tool.name': toolName,
 						'gen_ai.tool.type': 'function',
 						'lk.function_tool.name': toolName,
 						'gen_ai.tool.call.arguments': this.config.captureToolIO
-							? this.truncate(this.safeStringify(input))
+							? this.sanitize(this.safeStringify(input))
 							: undefined,
 					});
 				},
@@ -910,7 +1036,7 @@ export class RunTreeTracker {
 				(output, runId) =>
 					this.closeRun(runId, {
 						'gen_ai.tool.call.result': this.config.captureToolIO
-							? this.truncate(this.safeStringify(output))
+							? this.sanitize(this.safeStringify(output))
 							: undefined,
 					}),
 			),
@@ -918,7 +1044,12 @@ export class RunTreeTracker {
 				'handleToolError',
 				(args) => ({ runId: args[1] as string, parentRunId: args[2] as string | undefined }),
 				(error, runId) =>
-					this.closeRun(runId, {}, { code: STATUS_ERROR, message: String(error).slice(0, 500) }),
+					this.closeRun(
+						runId,
+						{},
+						{ code: STATUS_ERROR, message: this.errorMessage(error) },
+						this.exceptionDetails(error),
+					),
 			),
 			handleAgentAction: this.guarded<[AgentActionLike, string, string | undefined]>(
 				'handleAgentAction',

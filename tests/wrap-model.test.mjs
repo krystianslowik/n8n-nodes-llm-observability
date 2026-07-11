@@ -17,11 +17,21 @@ const OPTIONS = {
 	maxPayloadSizeKb: 32,
 	samplingRatePercent: 100,
 	redactionPatterns: [],
+	environment: 'test',
+	tags: ['smoke', 'agent'],
+	release: 'release-1',
+	serviceName: 'support-automation',
+	itemIndex: 0,
 };
 
 const CREDENTIAL = {
 	endpointUrl: 'http://opik.local/api/v1/private/otel',
 	authType: 'customHeaders',
+};
+
+const OPENAI_SERIALIZED = {
+	id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'],
+	kwargs: { model: 'gpt-4o-mini' },
 };
 
 // NOTE: wrapModelWithTracing keeps a module-level pipeline registry keyed on
@@ -42,7 +52,7 @@ function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
 		},
 		getWorkflow: () => ({ id: 'wf-9', name: 'Spike WF', active: false }),
 		getExecutionId: () => executionId,
-		getNode: () => ({ name: 'Trace Exporter' }),
+		getNode: () => ({ name: 'Trace Exporter', id: 'node-1', type: 'traceExporter' }),
 	};
 }
 
@@ -97,7 +107,7 @@ test('handler ordering end-to-end: a mutating co-handler (N8nLlmTracing shape) c
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	const llm = spans.find((s) => s.name.startsWith('llm:'));
+	const llm = spans.find((s) => s.name.startsWith('chat '));
 	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
 	assert.equal(attrs['gen_ai.usage.input_tokens'], '11', 'usage read before the mutation');
 	assert.ok(
@@ -111,6 +121,14 @@ test('attachHandler is idempotent for arrays: re-attaching the same handler does
 	const model = { callbacks: [handler] };
 	assert.equal(attachHandler(model, handler), true);
 	assert.equal(model.callbacks.length, 1, 'the same handler is never pushed twice');
+});
+
+test('attachHandler moves a reused OTLP handler back to the front', () => {
+	const handler = { name: 'otel' };
+	const freshStepHandler = { name: 'execution-state' };
+	const model = { callbacks: [freshStepHandler, handler] };
+	assert.equal(attachHandler(model, handler), true);
+	assert.deepEqual(model.callbacks, [handler, freshStepHandler]);
 });
 
 test('attachHandler creates the array when callbacks is undefined', () => {
@@ -151,6 +169,9 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 		'run-1',
 		'agent-run',
 	);
+	const traceContext = returned.getTraceContext();
+	assert.match(traceContext.traceId, /^[0-9a-f]{32}$/);
+	assert.match(traceContext.rootSpanId, /^[0-9a-f]{16}$/);
 	handler.handleLLMEnd(
 		{
 			generations: [[{ text: 'answer' }]],
@@ -176,6 +197,12 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	);
 	assert.equal(attrs['n8n.workflow.id'], 'wf-9');
 	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
+	assert.equal(attrs['n8n.node.id'], 'node-1');
+	assert.equal(attrs['n8n.node.type'], 'traceExporter');
+	assert.equal(attrs['deployment.environment.name'], 'test');
+	assert.equal(attrs['langfuse.release'], 'release-1');
+	assert.equal(attrs['n8n.metadata.env'], 'test');
+	assert.equal(attrs['langfuse.trace.metadata.env'], 'test');
 	assert.equal(attrs['session.id'], 'sess-1');
 	assert.equal(attrs['user.id'], 'user-1');
 	// Backend-native grouping keys fan out from Session ID / User ID:
@@ -186,6 +213,37 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	assert.equal(attrs['langfuse.session.id'], 'sess-1');
 	assert.equal(attrs['langfuse.user.id'], 'user-1');
 	assert.equal(attrs['gen_ai.request.model'], 'gpt-4o-mini');
+	assert.equal(attrs['langfuse.observation.type'], 'generation');
+	const resourceAttrs = Object.fromEntries(
+		httpCalls[0].body.resourceSpans[0].resource.attributes.map((attribute) => [
+			attribute.key,
+			Object.values(attribute.value)[0],
+		]),
+	);
+	assert.equal(resourceAttrs['service.name'], 'support-automation');
+	assert.equal(resourceAttrs['service.version'], 'release-1');
+});
+
+test('configured redaction also sanitizes metadata and tags before they become searchable attributes', async () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-redaction-context'),
+		model,
+		{
+			...OPTIONS,
+			metadata: { customer: 'secret-alice' },
+			tags: ['secret-internal'],
+			redactionPatterns: ['secret-[a-z]+'],
+		},
+		CREDENTIAL,
+	);
+	model.callbacks[0].handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	model.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer' }]] }, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	assert.ok(!JSON.stringify(httpCalls).includes('secret-'));
+	assert.ok(JSON.stringify(httpCalls).includes('[REDACTED]'));
 });
 
 test('empty Session ID / User ID emit NO session, thread, or user attributes', async () => {
@@ -268,7 +326,7 @@ test('one execution shares one pipeline: spans from separate wrap calls share a 
 		'one execution -> one trace',
 	);
 	const root = spans.find((span) => span.parentSpanId === undefined);
-	const [llm1, llm2] = spans.filter((span) => span.name.startsWith('llm:'));
+	const [llm1, llm2] = spans.filter((span) => span.name.startsWith('chat '));
 	assert.equal(llm1.parentSpanId, root.spanId);
 	assert.equal(llm2.parentSpanId, root.spanId);
 	assert.notEqual(llm1.spanId, llm2.spanId);
@@ -407,7 +465,7 @@ test('non-numeric Max Payload Size falls back to the 32 KB default budget instea
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	const llm = spans.find((s) => s.name.startsWith('llm:'));
+	const llm = spans.find((s) => s.name.startsWith('chat '));
 	const attrs = Object.fromEntries(llm.attributes.map((a) => [a.key, Object.values(a.value)[0]]));
 	assert.ok(
 		String(attrs['gen_ai.input.messages']).includes('short prompt'),
@@ -589,7 +647,7 @@ test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace
 		!('n8n.tool.result_observed' in attrs),
 		'a matched tool span carries no unmatched marker',
 	);
-	assert.equal(spans.filter((s) => s.name.startsWith('llm:')).length, 2, 'both LLM calls present');
+	assert.equal(spans.filter((s) => s.name.startsWith('chat ')).length, 2, 'both LLM calls present');
 });
 
 test('closeFunction is idempotent: calling it more than once never throws', async () => {

@@ -58,7 +58,12 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 	// THE regression test: response must be the unwrapped model, not the
 	// array getInputConnectionData handed back.
 	assert.equal(result.response, model, 'response must be the unwrapped model, not the supplied array');
-	assert.equal(model.callbacks.length, 1, 'exactly one tracing handler attached to the model');
+	assert.equal(model.callbacks.length, 2, 'OTLP and n8n execution-state handlers are attached');
+	assert.deepEqual(
+		model.callbacks.map((callback) => callback.name),
+		['n8nTraceExporterOtel', 'n8nTraceExporterExecutionState'],
+		'the non-mutating UI handler stays behind OTLP capture but ahead of the supplied model callbacks',
+	);
 	assert.equal(typeof result.closeFunction, 'function', 'supplyData wires up the eviction closeFunction');
 
 	const handler = model.callbacks[0];
@@ -78,7 +83,7 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 	}
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
 	assert.ok(
-		spans.some((s) => s.name === 'llm:gpt-4o-mini'),
+		spans.some((s) => s.name === 'chat gpt-4o-mini'),
 		'the llm span from handleChatModelStart/handleLLMEnd made it into a POST body',
 	);
 });
@@ -90,7 +95,56 @@ test('supplyData also accepts the model directly (maxConnections: 1 shape on cur
 	const result = await new TraceExporter().supplyData.call(ctx, 0);
 
 	assert.equal(result.response, model, 'a directly-supplied model passes through unwrapped');
-	assert.equal(model.callbacks.length, 1, 'exactly one tracing handler attached to the model');
+	assert.equal(model.callbacks.length, 2, 'OTLP and n8n execution-state handlers are attached');
+});
+
+test('reusing a model replaces the stale UI handler and keeps OTLP first', async () => {
+	const model = { callbacks: [] };
+	await new TraceExporter().supplyData.call(
+		fakeCtx({ model, executionId: 'exec-supply-data-reuse' }),
+		0,
+	);
+	const firstUiHandler = model.callbacks[1];
+	await new TraceExporter().supplyData.call(
+		fakeCtx({ model, executionId: 'exec-supply-data-reuse' }),
+		0,
+	);
+	assert.equal(model.callbacks.length, 2, 'no stale callback accumulates');
+	assert.equal(model.callbacks[0].name, 'n8nTraceExporterOtel');
+	assert.equal(model.callbacks[1].name, 'n8nTraceExporterExecutionState');
+	assert.notEqual(model.callbacks[1], firstUiHandler, 'the current step context replaces the old one');
+});
+
+test('supplyData execution-state handler receives the OTLP trace IDs after the model starts', async () => {
+	const model = { callbacks: [] };
+	const ctx = fakeCtx({ model, executionId: 'exec-supply-data-trace-id' });
+	const inputs = [];
+	const outputs = [];
+	ctx.addInputData = (_connectionType, data) => {
+		inputs.push(data);
+		return { index: 0 };
+	};
+	ctx.addOutputData = (...args) => outputs.push(args);
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const [otel, executionState] = model.callbacks;
+	const llm = {
+		id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'],
+		kwargs: { model: 'gpt-4o-mini' },
+	};
+	// LangChain's chat fallback invokes the OTLP chat hook first, then the
+	// execution-state handler's LLM hook in callback order.
+	otel.handleChatModelStart(llm, [[]], 'run-1');
+	executionState.handleLLMStart(llm, [], 'run-1');
+	otel.handleLLMEnd({}, 'run-1');
+	executionState.handleLLMEnd({}, 'run-1');
+
+	const inputJson = inputs[0][0][0].json;
+	const outputJson = outputs[0][2][0][0].json;
+	assert.match(inputJson.traceId, /^[0-9a-f]{32}$/);
+	assert.match(inputJson.rootSpanId, /^[0-9a-f]{16}$/);
+	assert.equal(outputJson.traceId, inputJson.traceId);
+	assert.equal(outputJson.rootSpanId, inputJson.rootSpanId);
 });
 
 test('description declares a single ai_languageModel input capped at one connection', () => {

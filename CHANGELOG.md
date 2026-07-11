@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.4 - 2026-07-10
+
+### Added
+
+- Report Trace Exporter model runs through n8n's execution-state API, so the
+  middleware appears executed (green) and exposes the OTLP `traceId` and root
+  `spanId` in run data for direct backend correlation.
+- Apply configurable JavaScript-regex redaction to every captured prompt,
+  completion, tool argument/result, error, tag, and metadata value before
+  export. Invalid patterns are ignored and counted without logging their text.
+- Add searchable Environment, Tags, Release, Service Name, node identity, item
+  index, and flattened metadata attributes, including Langfuse-native mappings.
+- Export GenAI request controls plus response ID, resolved model, and finish
+  reason when the provider callback exposes them.
+- Emit standard OTel exception events and propagate LLM failures to the
+  synthetic agent root instead of leaving a failed trace apparently healthy.
+
+### Changed
+
+- Make the Langfuse, Opik, and Datadog credential presets operational:
+  Langfuse ingestion v4; Opik workspace/project routing; and Datadog LLM
+  Observability source/application headers are added automatically. Additional
+  headers now compose with every primary auth mode and may override defaults.
+- Use current OTel GenAI `gen_ai.provider.name` and standard `chat <model>` span
+  naming while retaining deprecated `gen_ai.system` for older backend mappers.
+- Export the package's real instrumentation scope name/version, sampled span
+  flags, OTLP array attributes, and Langfuse agent/generation/tool/chain types.
+- Exclude the unregistered, unimplemented Observability-node stubs and build
+  cache from the npm tarball; only the shipped Trace Exporter is packaged.
+
 ## 0.1.3 - 2026-07-10
 
 ### Fixed
