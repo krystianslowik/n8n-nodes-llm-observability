@@ -1,145 +1,171 @@
 # n8n-nodes-observability
 
-OpenTelemetry tracing for n8n AI Agent workflows.
+An n8n community node that exports AI Agent executions as OpenTelemetry traces.
+The Trace Exporter is a passthrough sub-node between a Chat Model and an AI
+Agent. It does not replace either node and has no runtime dependencies.
 
-The **Trace Exporter** is a passthrough sub-node inserted between a Chat Model
-and the AI Agent. Each agent execution is exported as one OTLP/HTTP JSON trace:
-one span per LLM call (model, token usage, latency, errors; prompts and
-completions opt-in) plus reconstructed tool-call spans. Compatible backends:
-Comet Opik, Langfuse, Datadog, or any OTLP/HTTP collector. The package has no
-runtime dependencies and does not modify the model or agent nodes.
-
+```mermaid
+flowchart LR
+    Model["Chat Model"] -->|ai_languageModel| Exporter["Trace Exporter"]
+    Exporter -->|ai_languageModel| Agent["AI Agent"]
+    Exporter -. "OTLP/HTTP JSON" .-> Backend["Opik · Langfuse · Datadog · OTel Collector"]
 ```
-[Anthropic Chat Model] ──ai_languageModel──▶ [Trace Exporter] ──ai_languageModel──▶ [AI Agent]
-```
-
-## What a trace looks like
-
-One trace per agent execution (n8n execution ID), named after the Trace Name
-parameter:
-
-```
-trace "support-agent-run"
-├─ support-agent-run                 input: "…"  output: "The result is 163344"
-├─ chat claude-sonnet-4-6   683 tok   input messages: [{"role":"user","parts":[…]}]
-├─ execute_tool calculator           arguments: "2 × 81672"  result: "163344"
-└─ chat claude-sonnet-4-6   791 tok   output messages: [{"role":"assistant","parts":[…]}]
-```
-
-Spans use OTel GenAI semantic-convention attributes; backends that map them
-(e.g. Opik) derive model, provider, per-call token usage, and cost from the
-attributes directly.
 
 ## Installation
 
-**Self-hosted n8n:** Settings → Community Nodes → Install → `n8n-nodes-observability`.
+In self-hosted n8n, open **Settings → Community Nodes → Install** and enter:
 
-Requires n8n with AI (LangChain) nodes available. No external services beyond
-your observability backend.
+```text
+n8n-nodes-observability
+```
+
+Requires n8n with AI/LangChain nodes and Node.js 22.22 or newer.
 
 ## Setup
 
-1. Add the **Trace Exporter** node between your Chat Model and your AI Agent
-   (both connections are the model type — the node is a passthrough).
-2. Create an **OTLP Exporter API** credential:
+1. Connect the Chat Model to the Trace Exporter.
+2. Connect the Trace Exporter to the AI Agent.
+3. Create an **OTLP Exporter API** credential.
+4. Test the credential, then run the workflow.
 
-| Backend | Endpoint URL | Primary auth | Preset behavior |
-|---|---|---|---|
-| Comet Opik (cloud) | `https://www.comet.com/opik/api/v1/private/otel` | API Key Header — `Authorization` | Set Opik Workspace and Project Name; the preset sends `Comet-Workspace` and `projectName` |
-| Opik (self-hosted) | `http://<host>:5173/api/v1/private/otel` | Custom Headers / none | Project Name is optional |
-| Langfuse | `https://cloud.langfuse.com/api/public/otel` | Basic Auth — public key / secret key | Sends `x-langfuse-ingestion-version: 4` |
-| Datadog | `https://otlp-http-intake.logs.<site>/v1/traces` | API Key Header — `dd-api-key` | Sends `dd-otlp-source: llmobs` and the configured `dd-ml-app` |
-| Any OTel collector | your collector's OTLP/HTTP base | as configured | Custom preset adds nothing |
+Both node connections must use `ai_languageModel`.
 
-**Additional Headers** are applied after the preset and primary auth for every
-auth mode. This supports proxies and self-hosted routing, and intentionally
-allows an advanced configuration to override a preset header.
+### Credentials
 
-> The credential's **Test** button POSTs an empty OTLP payload
-> (`{"resourceSpans":[]}`) to `<endpoint>/v1/traces` — the same URL the
-> exporter uses — so a reachable backend with valid auth answers 2xx and the
-> test passes. No spans are ingested by the test.
+| Backend           | Endpoint                                         | Authentication                      |
+| ----------------- | ------------------------------------------------ | ----------------------------------- |
+| Comet Opik Cloud  | `https://www.comet.com/opik/api/v1/private/otel` | API Key Header: `Authorization`     |
+| Opik self-hosted  | `http://<host>:5173/api/v1/private/otel`         | None or custom headers              |
+| Langfuse Cloud    | `https://cloud.langfuse.com/api/public/otel`     | Basic Auth: public key / secret key |
+| Datadog           | `https://otlp-http-intake.logs.<site>/v1/traces` | API Key Header: `dd-api-key`        |
+| Generic collector | OTLP/HTTP base URL                               | Collector-specific                  |
 
-3. Optionally set **Trace Name** (names the trace in your backend),
-   **Session ID** and **User ID** (expression-friendly — e.g. reference a chat
-   session), and **Custom Metadata**.
+The presets add these headers:
 
-**Session/thread grouping:** Session ID is exported under the keys each
-backend natively groups on — `thread_id` and `gen_ai.conversation.id` (Opik
-picks up either as the trace's thread, so executions sharing a Session ID
-appear as one conversation under Opik's *Threads*), and `session.id` /
-`langfuse.session.id` (Langfuse *Sessions*). User ID is likewise exported as
-`user.id` and `langfuse.user.id` (Langfuse *Users*). Set Session ID to a chat
-session key (e.g. `{{ $json.sessionId }}`) to get per-conversation grouping.
+| Preset   | Headers                                          |
+| -------- | ------------------------------------------------ |
+| Opik     | `Comet-Workspace`, `projectName` when configured |
+| Langfuse | `x-langfuse-ingestion-version: 4`                |
+| Datadog  | `dd-otlp-source: llmobs`, `dd-ml-app`            |
+| Custom   | None                                             |
 
-## Options
+**Additional Headers** are applied after preset and authentication headers and
+can override them.
 
-| Option | Default | Notes |
-|---|---|---|
-| Capture Prompts/Completions | **off** | Full prompt/completion text in spans. Off by default: prompt data does not leave your instance unless you opt in. |
-| Capture Tool I/O | **off** | Tool-call information from the model's responses. |
-| Environment | — | Searchable deployment environment (`deployment.environment.name`, Langfuse environment). |
-| Max Payload Size (KB) | 32 | Captured payloads are truncated before export. |
-| Redaction Patterns | — | JavaScript regexes (raw or `/pattern/flags`); all matches become `[REDACTED]` before export. |
-| Release | — | Searchable release/deployment version. |
-| Sampling Rate (%) | 100 | Traces below the sample are dropped in-process. |
-| Service Name | `n8n` | OTel `service.name` resource attribute. |
-| Tags | — | Searchable trace labels, including Langfuse-native trace tags. |
+The credential test sends an empty OTLP request to `<endpoint>/v1/traces`. It
+checks connectivity and authentication without creating a span.
 
-**Failure policy:** export is asynchronous and fire-and-forget. A slow or
-unreachable backend can only ever mean dropped trace data — never a failed or
-slowed workflow. Failed exports are logged as warnings.
+## Trace structure
 
-## What is captured (and what isn't)
+One n8n workflow execution produces one trace. A trace contains a synthetic
+root span and one child span for each model or reconstructed tool call.
 
-Captured per LLM call: requested/resolved model, provider, request controls,
-response ID/finish reason, input/output token usage, latency, errors, and — only
-when enabled — prompts, completions, and model-side tool-call decisions. All
-spans carry n8n context (`n8n.workflow.id/name`, `n8n.execution.id`,
-`n8n.node.id/name/type`, item index) plus your session/user/metadata,
-environment, release, and tags.
+```mermaid
+flowchart TD
+    Root["Agent execution · root span"]
+    LLM1["LLM call 1 · requests tool"]
+    Tool["Tool call"]
+    LLM2["LLM call 2 · final answer"]
 
-The Trace Exporter also reports model start/end/error through n8n's sub-node
-execution API. It therefore turns green when the connected agent actually
-invokes the model, and its execution data includes the exported `traceId` and
-root `spanId` for correlation with the observability backend. Prompt and
-completion content is never duplicated into this n8n execution-state payload.
+    Root --> LLM1
+    Root --> Tool
+    Root --> LLM2
+    LLM1 -. "request" .-> Tool
+    Tool -. "result" .-> LLM2
+```
 
-Redaction applies before payloads leave the process, including error messages
-and searchable metadata—not only prompt text. Invalid regexes are ignored and
-reported by count without logging the pattern itself. Prompt/completion and
-tool I/O capture remain off by default.
+A backend's flat span or “LLM Calls” table shows these as four rows. They still
+belong to one trace and one n8n execution. A run without tools normally contains
+the root and one LLM span.
 
-Tool *executions* (the actual Calculator/HTTP/etc. runs between LLM calls) are
-not visible to a model-attached tracer in n8n's current architecture.
-`execute_tool <name>` spans are therefore reconstructed from what does pass
-through the model: the tool calls the model requested, matched to the results
-echoed back in the next model call. This includes n8n V3's fallback
-`Calling <tool> with input: <JSON>` message when a provider callback omits
-structured `tool_calls` (all reconstructed spans are marked
-`n8n.span.synthesized: true`). Their
-timing is derived from the surrounding LLM-call boundaries and includes n8n
-framework overhead, not pure tool runtime. A tool whose result never reaches a
-later model call (e.g. an error mid-tool) is still emitted at execution end,
-marked `n8n.tool.result_observed: false` and without output — as are id-less
-tool calls, which can't be matched to their results even when one did flow
-through a later model call. Tool input/output payloads are only captured with
-**Capture Tool I/O** enabled. Engine-level tool spans (exact timing, engine
-visibility) depend on an n8n-core extension point.
+The Trace Exporter reports model start, end, and error through n8n's sub-node
+execution API. It turns green when the agent invokes the model. Its execution
+data includes the exported `traceId` and root `spanId`.
+
+## Captured data
+
+Each LLM span can include:
+
+- requested and resolved model;
+- provider and GenAI operation;
+- input and output token usage;
+- request parameters exposed by the provider callback;
+- response ID, finish reason, duration, and error;
+- OTel exception events for failures.
+
+Every span also carries workflow, execution, node, item, session, user,
+environment, release, tag, and custom metadata where configured.
+
+Prompt, completion, and tool payloads are disabled by default:
+
+| Option                      | Default | Data added                                               |
+| --------------------------- | ------: | -------------------------------------------------------- |
+| Capture Prompts/Completions |     Off | Model input and output messages                          |
+| Capture Tool I/O            |     Off | Tool arguments and results visible to the model callback |
+
+n8n execution-state data never includes prompt or completion content.
+
+## Node options
+
+| Option                | Default | Description                                               |
+| --------------------- | ------: | --------------------------------------------------------- |
+| Environment           |       — | Deployment environment                                    |
+| Max Payload Size (KB) |    `32` | Maximum captured payload size before truncation           |
+| Redaction Patterns    |       — | JavaScript regular expressions replaced with `[REDACTED]` |
+| Release               |       — | Application or deployment version                         |
+| Sampling Rate (%)     |   `100` | Percentage of traces exported                             |
+| Service Name          |   `n8n` | OTel `service.name`                                       |
+| Tags                  |       — | Trace labels                                              |
+
+Redaction accepts raw expressions such as `\b\d{16}\b` and delimited
+expressions such as `/secret-[a-z0-9]+/gi`. It is applied before export to
+captured prompts, completions, tool payloads, errors, tags, and metadata.
+Invalid expressions are ignored and logged by count without logging the
+expression itself.
+
+## Correlation attributes
+
+Set **Session ID** to a conversation key such as `{{ $json.sessionId }}` to
+group several workflow executions.
+
+| Purpose          | Attributes                                     |
+| ---------------- | ---------------------------------------------- |
+| Opik thread      | `thread_id`, `gen_ai.conversation.id`          |
+| Langfuse session | `session.id`, `langfuse.session.id`            |
+| Langfuse user    | `user.id`, `langfuse.user.id`                  |
+| Custom metadata  | `n8n.metadata` and flattened searchable fields |
+
+## Tool spans
+
+n8n's model callback does not expose tool-node execution directly. The Trace
+Exporter reconstructs a tool span from the model's tool request and the result
+included in the next model call.
+
+Reconstructed spans have `n8n.span.synthesized = true`. Their timing covers the
+interval between model callbacks and can include n8n overhead. If no later tool
+result is observed, the span is emitted without output and with
+`n8n.tool.result_observed = false`.
+
+Exact tool-node timing requires an n8n-core extension point.
+
+## Export behavior
+
+- Export is asynchronous and does not fail the workflow.
+- HTTP requests have a bounded timeout.
+- The in-memory span queue is bounded.
+- Failed exports are logged as warnings.
+- Prompt/completion and tool payload capture are off by default.
+
+Retry with backoff, compression, explicit flush diagnostics, and
+multi-destination fan-out are not implemented.
 
 ## Compatibility
 
-Tested against n8n 2.29 with the AI Agent (Tools Agent) and Anthropic/OpenAI
-chat models; any Chat Model sub-node should work — the tracer attaches at the
-LangChain callback level and contains no provider-specific code. Requires
-Node.js ≥ 22.22 on self-hosted instances.
+Tested with n8n 2.29's AI Agent/Tools Agent and Anthropic/OpenAI chat models.
+The tracer attaches through LangChain callbacks and does not import a provider
+SDK at runtime.
 
-## Roadmap
-
-- Score / feedback and dataset-item operations
-- Engine-level tool spans with exact timing (requires an n8n-core extension point)
-- Export retry/backoff, batching, compression, and explicit flush diagnostics
-- Multi-destination fan-out
+Score/feedback and dataset-item operations are not shipped.
 
 ## License
 
