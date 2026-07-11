@@ -4,7 +4,10 @@
  * no global tracer state, nothing to bundle.
  */
 
-export type OtlpAttrValue = string | number | boolean;
+import packageMetadata from '../../../package.json';
+
+export type OtlpAttrPrimitive = string | number | boolean;
+export type OtlpAttrValue = OtlpAttrPrimitive | OtlpAttrPrimitive[];
 
 export interface OtlpKeyValue {
 	key: string;
@@ -20,6 +23,13 @@ export interface OtlpSpan {
 	startTimeUnixNano: string;
 	endTimeUnixNano: string;
 	attributes: OtlpKeyValue[];
+	/** W3C sampled trace flag. */
+	flags?: number;
+	events?: Array<{
+		timeUnixNano: string;
+		name: string;
+		attributes: OtlpKeyValue[];
+	}>;
 	/** OTel convention: omitted (UNSET) on success; ERROR only on failure. */
 	status?: { code: number; message?: string };
 }
@@ -67,7 +77,18 @@ export function toOtlpAttributes(attrs: Record<string, OtlpAttrValue | undefined
 	for (const [key, raw] of Object.entries(attrs)) {
 		if (raw === undefined) continue;
 		let value: Record<string, unknown>;
-		if (typeof raw === 'string') value = { stringValue: raw };
+		if (Array.isArray(raw)) {
+			value = {
+				arrayValue: {
+					values: raw.map((entry) => {
+						if (typeof entry === 'string') return { stringValue: entry };
+						if (typeof entry === 'boolean') return { boolValue: entry };
+						if (Number.isInteger(entry)) return { intValue: String(entry) };
+						return { doubleValue: entry };
+					}),
+				},
+			};
+		} else if (typeof raw === 'string') value = { stringValue: raw };
 		else if (typeof raw === 'boolean') value = { boolValue: raw };
 		else if (Number.isInteger(raw)) value = { intValue: String(raw) };
 		else value = { doubleValue: raw };
@@ -86,8 +107,8 @@ export function buildExportRequest(
 				resource: { attributes: toOtlpAttributes(resourceAttributes) },
 				scopeSpans: [
 					{
-						scope: { name: 'n8n-nodes-llm-observability', version: '0.1.0' },
-						spans,
+						scope: { name: packageMetadata.name, version: packageMetadata.version },
+						spans: spans.map((span) => ({ ...span, flags: span.flags ?? 1 })),
 					},
 				],
 			},

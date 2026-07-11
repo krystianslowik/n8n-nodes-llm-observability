@@ -32,3 +32,25 @@ test('authenticate sets the API key under the configured header name when presen
 	);
 	assert.equal(result.headers['DD-API-KEY'], 'k-123');
 });
+
+test('authenticate applies operational preset headers and additive custom headers', async () => {
+	const credential = new OtlpExporterApi();
+	const result = await credential.authenticate(
+		{
+			preset: 'opik',
+			authType: 'apiKeyHeader',
+			apiKey: 'key',
+			headerName: 'Authorization',
+			opikWorkspace: 'workspace',
+			opikProjectName: 'project',
+			customHeaders: '{"projectName":"override","x-route":"blue"}',
+		},
+		{ url: 'http://x', headers: {} },
+	);
+	assert.deepEqual(result.headers, {
+		'Comet-Workspace': 'workspace',
+		projectName: 'override',
+		Authorization: 'key',
+		'x-route': 'blue',
+	});
+});

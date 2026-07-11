@@ -4,12 +4,13 @@ import type { TracingHooks } from './callbackTypes';
 import { buildExportTarget, SpanExporter } from './otlpExport';
 import type { OtlpCredential } from './otlpExport';
 import type { OtlpAttrValue } from './otlpJson';
+import { compileRedactor } from './redaction';
 import { RunTreeTracker } from './runTreeTracker';
 
 /**
  * Options read from the Trace Exporter node's parameters (PRD §5 "Node A
- * options"). `redactionPatterns` is accepted but not yet applied — the spike
- * scopes redaction out (spec §"Out of scope"); FINDINGS.md records it.
+ * options"). Content capture is opt-in and every captured string passes
+ * through the configured regex redactor before export.
  */
 export interface TraceExporterOptions {
 	traceName: string;
@@ -22,6 +23,11 @@ export interface TraceExporterOptions {
 	maxPayloadSizeKb: number;
 	samplingRatePercent: number;
 	redactionPatterns: string[];
+	environment: string;
+	tags: string[];
+	release: string;
+	serviceName: string;
+	itemIndex: number;
 }
 
 /**
@@ -49,8 +55,18 @@ export function attachHandler(model: unknown, handler: TracingHooks): boolean {
 	}
 	if (Array.isArray(callbacks)) {
 		// Idempotent: if n8n ever reuses a model instance across supplyData
-		// calls, re-adding the same handler would double every span.
-		if (callbacks.includes(handler)) return true;
+		// calls, re-adding the same handler would double every span. Move an
+		// existing instance back to the front: a fresh step-local execution
+		// handler may have been attached since the prior call, but OTLP capture
+		// must still run first (before n8n mutates the provider result).
+		const existingIndex = callbacks.indexOf(handler);
+		if (existingIndex >= 0) {
+			if (existingIndex > 0) {
+				callbacks.splice(existingIndex, 1);
+				callbacks.unshift(handler);
+			}
+			return true;
+		}
 		callbacks.unshift(handler);
 		return true;
 	}
@@ -65,6 +81,7 @@ export function attachHandler(model: unknown, handler: TracingHooks): boolean {
 function collectBaseAttributes(
 	ctx: ISupplyDataFunctions,
 	options: TraceExporterOptions,
+	redact: (text: string) => string,
 ): Record<string, OtlpAttrValue> {
 	const attributes: Record<string, OtlpAttrValue> = {};
 	try {
@@ -80,11 +97,28 @@ function collectBaseAttributes(
 		/* never break the workflow */
 	}
 	try {
-		attributes['n8n.node.name'] = ctx.getNode().name;
+		const node = ctx.getNode();
+		attributes['n8n.node.name'] = node.name;
+		attributes['n8n.node.type'] = node.type;
+		if (node.id) attributes['n8n.node.id'] = node.id;
 	} catch {
 		/* never break the workflow */
 	}
 	if (options.traceName) attributes['n8n.trace.name'] = options.traceName;
+	attributes['n8n.item.index'] = options.itemIndex;
+	if (options.environment) {
+		attributes['deployment.environment.name'] = options.environment;
+		attributes['langfuse.environment'] = options.environment;
+	}
+	if (options.release) {
+		attributes['langfuse.release'] = options.release;
+		attributes['n8n.release'] = options.release;
+	}
+	const tags = Array.isArray(options.tags) ? options.tags : [];
+	if (tags.length > 0) {
+		attributes['langfuse.trace.tags'] = tags.map((tag) => redact(String(tag)).slice(0, 200));
+		attributes.tags = tags.map((tag) => redact(String(tag)).slice(0, 200));
+	}
 	if (options.sessionId) {
 		// Langfuse maps this generic key to its Session (docs/opentelemetry/get-started).
 		attributes['session.id'] = options.sessionId;
@@ -110,11 +144,37 @@ function collectBaseAttributes(
 			metadata = undefined;
 		}
 	}
-	if (metadata && typeof metadata === 'object' && Object.keys(metadata).length > 0) {
+	if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
 		try {
-			attributes['n8n.metadata'] = JSON.stringify(metadata).slice(0, 4096);
+			attributes['n8n.metadata'] = redact(JSON.stringify(metadata)).slice(0, 4096);
 		} catch {
 			/* never break the workflow */
+		}
+		let entries: Array<[string, unknown]> = [];
+		try {
+			entries = Object.entries(metadata).slice(0, 50);
+		} catch {
+			entries = [];
+		}
+		for (const [rawKey, rawValue] of entries) {
+			const key = rawKey.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 100);
+			if (!key) continue;
+			let value: string;
+			try {
+				value =
+					typeof rawValue === 'string'
+						? rawValue
+						: (JSON.stringify(rawValue) ?? String(rawValue));
+			} catch {
+				try {
+					value = String(rawValue);
+				} catch {
+					value = '[unserializable]';
+				}
+			}
+			const sanitized = redact(value).slice(0, 500);
+			attributes[`n8n.metadata.${key}`] = sanitized;
+			attributes[`langfuse.trace.metadata.${key}`] = sanitized;
 		}
 	}
 	return attributes;
@@ -152,6 +212,7 @@ interface PipelineEntry {
 	handler: TracingHooks;
 	finalize: (atMs?: number) => void;
 	retryPendingRoot: () => void;
+	getTraceContext: () => { traceId: string; rootSpanId: string } | undefined;
 	/** Set at every closeFunction, cleared when a later step reuses the entry. */
 	closedAt?: number;
 }
@@ -204,6 +265,7 @@ function buildCloseFunction(registryKey: string): () => Promise<void> {
 export interface WrappedModel {
 	model: unknown;
 	closeFunction?: () => Promise<void>;
+	getTraceContext?: () => { traceId: string; rootSpanId: string } | undefined;
 }
 
 /**
@@ -241,10 +303,26 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			}
-			return { model, closeFunction: buildCloseFunction(registryKey) };
+			return {
+				model,
+				closeFunction: buildCloseFunction(registryKey),
+				getTraceContext: existing.getTraceContext,
+			};
 		}
 
 		const target = buildExportTarget(credential);
+		const redactor = compileRedactor(
+			Array.isArray(options.redactionPatterns) ? options.redactionPatterns : [],
+		);
+		if (redactor.invalidPatternCount > 0) {
+			try {
+				ctx.logger.warn(
+					`[TraceExporter] ignored ${redactor.invalidPatternCount} invalid redaction pattern(s)`,
+				);
+			} catch {
+				/* never break the workflow */
+			}
+		}
 		// `tracker` is constructed after `exporter`, but the exporter's
 		// failure callback needs to call back into the tracker (Fix: root
 		// re-emit on export failure). Resolve the chicken/egg with a mutable
@@ -259,7 +337,10 @@ export function wrapModelWithTracing(
 			// slot (and grow the bounded queue into drops) forever.
 			async (url, headers, body) =>
 				ctx.helpers.httpRequest({ method: 'POST', url, headers, body, json: true, timeout: 10000 }),
-			{ 'service.name': 'n8n-trace-exporter' },
+			{
+				'service.name': options.serviceName || 'n8n',
+				...(options.release ? { 'service.version': options.release } : {}),
+			},
 			(message) => {
 				try {
 					ctx.logger.warn(`[TraceExporter] ${message}`);
@@ -281,7 +362,8 @@ export function wrapModelWithTracing(
 				samplingRatePercent: options.samplingRatePercent,
 				singleTrace: true,
 				rootSpanName: options.traceName || 'n8n agent execution',
-				baseAttributes: collectBaseAttributes(ctx, options),
+				baseAttributes: collectBaseAttributes(ctx, options, redactor.redact),
+				redact: redactor.redact,
 				onEvent: (event) => {
 					try {
 						ctx.logger.info(
@@ -325,6 +407,7 @@ export function wrapModelWithTracing(
 				handler,
 				finalize: (atMs?: number) => tracker.finalize(atMs),
 				retryPendingRoot: () => tracker.retryPendingRoot(),
+				getTraceContext: () => tracker.getTraceContext(),
 			});
 		}
 		const attached = attachHandler(model, handler);
@@ -340,6 +423,7 @@ export function wrapModelWithTracing(
 		return {
 			model,
 			closeFunction: registryKey ? buildCloseFunction(registryKey) : undefined,
+			getTraceContext: () => tracker.getTraceContext(),
 		};
 	} catch (error) {
 		try {

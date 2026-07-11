@@ -67,6 +67,33 @@ export function completionTextFrom(output: LlmResultLike): string | undefined {
 	return typeof text === 'string' && text.length > 0 ? text : undefined;
 }
 
+export function responseDetailsFrom(output: LlmResultLike): {
+	id?: string;
+	model?: string;
+	finishReasons?: string[];
+} {
+	const generation = output.generations?.[0]?.[0];
+	const message = generation?.message;
+	const rawId = output.llmOutput?.id ?? message?.id;
+	const rawModel =
+		output.llmOutput?.model ??
+		output.llmOutput?.model_name ??
+		message?.response_metadata?.model ??
+		message?.response_metadata?.model_name;
+	const rawFinishReason =
+		generation?.generationInfo?.finish_reason ??
+		generation?.generationInfo?.stop_reason ??
+		message?.response_metadata?.finish_reason ??
+		message?.response_metadata?.stop_reason;
+	return {
+		...(typeof rawId === 'string' && rawId.length > 0 ? { id: rawId } : {}),
+		...(typeof rawModel === 'string' && rawModel.length > 0 ? { model: rawModel } : {}),
+		...(typeof rawFinishReason === 'string' && rawFinishReason.length > 0
+			? { finishReasons: [rawFinishReason] }
+			: {}),
+	};
+}
+
 /**
  * Sanity cap on extracted tool calls per LLM result, applied by slicing the
  * source array BEFORE mapping so a giant malformed `tool_calls` payload never

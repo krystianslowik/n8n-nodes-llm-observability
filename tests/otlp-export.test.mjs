@@ -64,6 +64,44 @@ test('buildExportTarget parses custom headers from a JSON string, tolerates garb
 	assert.equal(bad.headers['Content-Type'], 'application/json');
 });
 
+test('vendor presets add their required headers and compose with primary auth plus overrides', () => {
+	const langfuse = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'langfuse',
+		authType: 'basicAuth',
+		username: 'pk',
+		password: 'sk',
+	});
+	assert.equal(langfuse.headers['x-langfuse-ingestion-version'], '4');
+	assert.match(langfuse.headers.Authorization, /^Basic /);
+
+	const opik = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'opik',
+		authType: 'apiKeyHeader',
+		apiKey: 'opik-key',
+		opikWorkspace: 'workspace-a',
+		opikProjectName: 'project-a',
+		customHeaders: { projectName: 'override-project', ignored: { nested: true } },
+	});
+	assert.equal(opik.headers.Authorization, 'opik-key');
+	assert.equal(opik.headers['Comet-Workspace'], 'workspace-a');
+	assert.equal(opik.headers.projectName, 'override-project');
+	assert.equal(opik.headers.ignored, undefined, 'non-primitive headers are ignored');
+
+	const datadog = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'datadog',
+		authType: 'apiKeyHeader',
+		apiKey: 'dd-key',
+		headerName: 'dd-api-key',
+		datadogMlApp: 'support-agent',
+	});
+	assert.equal(datadog.headers['dd-api-key'], 'dd-key');
+	assert.equal(datadog.headers['dd-otlp-source'], 'llmobs');
+	assert.equal(datadog.headers['dd-ml-app'], 'support-agent');
+});
+
 test('SpanExporter posts an OTLP body per add and counts successes', async () => {
 	const calls = [];
 	const exporter = new SpanExporter(

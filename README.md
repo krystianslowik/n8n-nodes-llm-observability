@@ -21,9 +21,9 @@ parameter:
 ```
 trace "support-agent-run"
 ├─ support-agent-run                 input: "…"  output: "The result is 163344"
-├─ llm:claude-sonnet-4-6   683 tok   input messages: [{"role":"user","parts":[…]}]
+├─ chat claude-sonnet-4-6   683 tok   input messages: [{"role":"user","parts":[…]}]
 ├─ execute_tool calculator           arguments: "2 × 81672"  result: "163344"
-└─ llm:claude-sonnet-4-6   791 tok   output messages: [{"role":"assistant","parts":[…]}]
+└─ chat claude-sonnet-4-6   791 tok   output messages: [{"role":"assistant","parts":[…]}]
 ```
 
 Spans use OTel GenAI semantic-convention attributes; backends that map them
@@ -43,13 +43,17 @@ your observability backend.
    (both connections are the model type — the node is a passthrough).
 2. Create an **OTLP Exporter API** credential:
 
-| Backend | Endpoint URL | Auth |
-|---|---|---|
-| Comet Opik (cloud) | `https://www.comet.com/opik/api/v1/private/otel` | API Key Header — header `authorization`, plus custom headers for `Comet-Workspace` and `projectName` if needed |
-| Opik (self-hosted) | `http://<host>:5173/api/v1/private/otel` | Custom Headers `{}` (none by default) |
-| Langfuse | `https://cloud.langfuse.com/api/public/otel` | Basic Auth — public key / secret key |
-| Datadog | `https://otlp-http-intake.logs.<site>/v1/traces` | API Key Header — header `DD-API-KEY` |
-| Any OTel collector | your collector's OTLP/HTTP base | as configured |
+| Backend | Endpoint URL | Primary auth | Preset behavior |
+|---|---|---|---|
+| Comet Opik (cloud) | `https://www.comet.com/opik/api/v1/private/otel` | API Key Header — `Authorization` | Set Opik Workspace and Project Name; the preset sends `Comet-Workspace` and `projectName` |
+| Opik (self-hosted) | `http://<host>:5173/api/v1/private/otel` | Custom Headers / none | Project Name is optional |
+| Langfuse | `https://cloud.langfuse.com/api/public/otel` | Basic Auth — public key / secret key | Sends `x-langfuse-ingestion-version: 4` |
+| Datadog | `https://otlp-http-intake.logs.<site>/v1/traces` | API Key Header — `dd-api-key` | Sends `dd-otlp-source: llmobs` and the configured `dd-ml-app` |
+| Any OTel collector | your collector's OTLP/HTTP base | as configured | Custom preset adds nothing |
+
+**Additional Headers** are applied after the preset and primary auth for every
+auth mode. This supports proxies and self-hosted routing, and intentionally
+allows an advanced configuration to override a preset header.
 
 > The credential's **Test** button POSTs an empty OTLP payload
 > (`{"resourceSpans":[]}`) to `<endpoint>/v1/traces` — the same URL the
@@ -74,9 +78,13 @@ session key (e.g. `{{ $json.sessionId }}`) to get per-conversation grouping.
 |---|---|---|
 | Capture Prompts/Completions | **off** | Full prompt/completion text in spans. Off by default: prompt data does not leave your instance unless you opt in. |
 | Capture Tool I/O | **off** | Tool-call information from the model's responses. |
+| Environment | — | Searchable deployment environment (`deployment.environment.name`, Langfuse environment). |
 | Max Payload Size (KB) | 32 | Captured payloads are truncated before export. |
+| Redaction Patterns | — | JavaScript regexes (raw or `/pattern/flags`); all matches become `[REDACTED]` before export. |
+| Release | — | Searchable release/deployment version. |
 | Sampling Rate (%) | 100 | Traces below the sample are dropped in-process. |
-| Redaction Patterns | — | Reserved; not applied yet in this version. |
+| Service Name | `n8n` | OTel `service.name` resource attribute. |
+| Tags | — | Searchable trace labels, including Langfuse-native trace tags. |
 
 **Failure policy:** export is asynchronous and fire-and-forget. A slow or
 unreachable backend can only ever mean dropped trace data — never a failed or
@@ -84,10 +92,23 @@ slowed workflow. Failed exports are logged as warnings.
 
 ## What is captured (and what isn't)
 
-Captured per LLM call: model name, provider, input/output token usage, latency,
-errors, and — only when enabled — prompts, completions, and model-side tool-call
-decisions. All spans carry n8n context (`n8n.workflow.id/name`,
-`n8n.execution.id`, `n8n.node.name`) plus your session/user/metadata.
+Captured per LLM call: requested/resolved model, provider, request controls,
+response ID/finish reason, input/output token usage, latency, errors, and — only
+when enabled — prompts, completions, and model-side tool-call decisions. All
+spans carry n8n context (`n8n.workflow.id/name`, `n8n.execution.id`,
+`n8n.node.id/name/type`, item index) plus your session/user/metadata,
+environment, release, and tags.
+
+The Trace Exporter also reports model start/end/error through n8n's sub-node
+execution API. It therefore turns green when the connected agent actually
+invokes the model, and its execution data includes the exported `traceId` and
+root `spanId` for correlation with the observability backend. Prompt and
+completion content is never duplicated into this n8n execution-state payload.
+
+Redaction applies before payloads leave the process, including error messages
+and searchable metadata—not only prompt text. Invalid regexes are ignored and
+reported by count without logging the pattern itself. Prompt/completion and
+tool I/O capture remain off by default.
 
 Tool *executions* (the actual Calculator/HTTP/etc. runs between LLM calls) are
 not visible to a model-attached tracer in n8n's current architecture.
@@ -116,7 +137,8 @@ Node.js ≥ 22.22 on self-hosted instances.
 ## Roadmap
 
 - Score / feedback and dataset-item operations
-- Engine-level tool spans (requires n8n-core support); redaction patterns
+- Engine-level tool spans with exact timing (requires an n8n-core extension point)
+- Export retry/backoff, batching, compression, and explicit flush diagnostics
 - Multi-destination fan-out
 
 ## License

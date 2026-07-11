@@ -4,6 +4,7 @@ import {
 	completionTextFrom,
 	genAiSystemFrom,
 	modelNameFrom,
+	responseDetailsFrom,
 	tokenUsageFrom,
 	toolCallsFrom,
 } from '../dist/nodes/TraceExporter/shared/genAiAttributes.js';
@@ -134,4 +135,20 @@ test('tokenUsageFrom prefers exact message usage_metadata over estimatedTokenUsa
 		llmOutput: { estimatedTokenUsage: { promptTokens: 99, completionTokens: 99 } },
 	});
 	assert.deepEqual(usage, { inputTokens: 10, outputTokens: 2 });
+});
+
+test('responseDetailsFrom extracts response id, resolved model, and finish reason', () => {
+	assert.deepEqual(
+		responseDetailsFrom({
+			generations: [
+				[
+					{
+						generationInfo: { finish_reason: 'stop' },
+						message: { id: 'msg-1', response_metadata: { model_name: 'gpt-4.1-2026' } },
+					},
+				],
+			],
+		}),
+		{ id: 'msg-1', model: 'gpt-4.1-2026', finishReasons: ['stop'] },
+	);
 });

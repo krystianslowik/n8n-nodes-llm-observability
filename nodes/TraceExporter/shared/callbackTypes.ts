@@ -18,8 +18,16 @@ export interface LlmResultLike {
 	generations?: Array<
 		Array<{
 			text?: string;
+			generationInfo?: { finish_reason?: unknown; stop_reason?: unknown };
 			message?: {
+				id?: unknown;
 				usage_metadata?: { input_tokens?: number; output_tokens?: number };
+				response_metadata?: {
+					model?: unknown;
+					model_name?: unknown;
+					finish_reason?: unknown;
+					stop_reason?: unknown;
+				};
 				/** LangChain-normalized tool calls the model decided to make (provider-agnostic). */
 				tool_calls?: Array<{ name?: string; args?: unknown; id?: string }>;
 				/**
@@ -38,6 +46,9 @@ export interface LlmResultLike {
 		}>
 	>;
 	llmOutput?: {
+		id?: unknown;
+		model?: unknown;
+		model_name?: unknown;
 		tokenUsage?: { promptTokens?: number; completionTokens?: number };
 		usage?: { input_tokens?: number; output_tokens?: number };
 		/** @langchain/openai Responses-API path; backend-reported there despite the name. */

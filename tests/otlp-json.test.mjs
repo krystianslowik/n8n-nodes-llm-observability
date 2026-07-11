@@ -30,6 +30,7 @@ test('toOtlpAttributes wraps values in OTLP envelopes and skips undefined', () =
 		'gen_ai.usage.input_tokens': 42,
 		'llm.is_streaming': false,
 		'gen_ai.temperature': 0.7,
+		tags: ['production', 'support'],
 		skipped: undefined,
 	});
 	assert.deepEqual(attrs, [
@@ -37,6 +38,10 @@ test('toOtlpAttributes wraps values in OTLP envelopes and skips undefined', () =
 		{ key: 'gen_ai.usage.input_tokens', value: { intValue: '42' } },
 		{ key: 'llm.is_streaming', value: { boolValue: false } },
 		{ key: 'gen_ai.temperature', value: { doubleValue: 0.7 } },
+		{
+			key: 'tags',
+			value: { arrayValue: { values: [{ stringValue: 'production' }, { stringValue: 'support' }] } },
+		},
 	]);
 });
 
@@ -44,7 +49,7 @@ test('buildExportRequest produces the OTLP ExportTraceServiceRequest shape', () 
 	const span = {
 		traceId: 'a'.repeat(32),
 		spanId: 'b'.repeat(16),
-		name: 'llm:gpt-4o',
+		name: 'chat gpt-4o',
 		kind: SPAN_KIND_CLIENT,
 		startTimeUnixNano: '1000000',
 		endTimeUnixNano: '2000000',
@@ -60,8 +65,8 @@ test('buildExportRequest produces the OTLP ExportTraceServiceRequest shape', () 
 				},
 				scopeSpans: [
 					{
-						scope: { name: 'n8n-nodes-llm-observability', version: '0.1.0' },
-						spans: [span],
+						scope: { name: 'n8n-nodes-observability', version: '0.1.4' },
+						spans: [{ ...span, flags: 1 }],
 					},
 				],
 			},

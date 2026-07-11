@@ -4,12 +4,56 @@ import type { OtlpAttrValue, OtlpSpan } from './otlpJson';
 /** Decrypted `otlpExporterApi` credential shape (credentials/OtlpExporterApi.credentials.ts). */
 export interface OtlpCredential {
 	endpointUrl: string;
+	preset?: 'langfuse' | 'opik' | 'datadog' | 'custom';
 	authType: 'basicAuth' | 'apiKeyHeader' | 'customHeaders';
 	username?: string;
 	password?: string;
 	apiKey?: string;
 	headerName?: string;
-	customHeaders?: string | Record<string, string>;
+	customHeaders?: string | Record<string, unknown>;
+	opikWorkspace?: string;
+	opikProjectName?: string;
+	datadogMlApp?: string;
+}
+
+/** Parse only primitive header values; objects cannot be valid HTTP headers. */
+export function parseAdditionalHeaders(raw: unknown): Record<string, string> {
+	let parsed: unknown = raw;
+	if (typeof raw === 'string') {
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return {};
+		}
+	}
+	if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+	const headers: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+			headers[key] = String(value);
+		}
+	}
+	return headers;
+}
+
+/** Headers required by each vendor's current OTLP intake contract. */
+export function presetHeaders(credential: OtlpCredential): Record<string, string> {
+	if (credential.preset === 'langfuse') {
+		return { 'x-langfuse-ingestion-version': '4' };
+	}
+	if (credential.preset === 'opik') {
+		return {
+			...(credential.opikWorkspace ? { 'Comet-Workspace': credential.opikWorkspace } : {}),
+			...(credential.opikProjectName ? { projectName: credential.opikProjectName } : {}),
+		};
+	}
+	if (credential.preset === 'datadog') {
+		return {
+			'dd-otlp-source': 'llmobs',
+			'dd-ml-app': credential.datadogMlApp || 'n8n',
+		};
+	}
+	return {};
 }
 
 /**
@@ -25,7 +69,10 @@ export function buildExportTarget(credential: OtlpCredential): {
 	const base = (credential.endpointUrl ?? '').replace(/\/+$/, '');
 	const url = base.endsWith('/v1/traces') ? base : `${base}/v1/traces`;
 
-	const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json',
+		...presetHeaders(credential),
+	};
 	if (credential.authType === 'basicAuth') {
 		const token = Buffer.from(`${credential.username ?? ''}:${credential.password ?? ''}`).toString(
 			'base64',
@@ -33,19 +80,10 @@ export function buildExportTarget(credential: OtlpCredential): {
 		headers.Authorization = `Basic ${token}`;
 	} else if (credential.authType === 'apiKeyHeader') {
 		if (credential.apiKey) headers[credential.headerName || 'Authorization'] = credential.apiKey;
-	} else if (credential.authType === 'customHeaders') {
-		let custom: Record<string, string> = {};
-		if (typeof credential.customHeaders === 'string') {
-			try {
-				custom = JSON.parse(credential.customHeaders) as Record<string, string>;
-			} catch {
-				custom = {};
-			}
-		} else if (credential.customHeaders && typeof credential.customHeaders === 'object') {
-			custom = credential.customHeaders;
-		}
-		Object.assign(headers, custom);
 	}
+	// Additional headers are additive for every auth mode and intentionally
+	// applied last so advanced/self-hosted deployments can override defaults.
+	Object.assign(headers, parseAdditionalHeaders(credential.customHeaders));
 	return { url, headers };
 }
 
