@@ -68,7 +68,10 @@ export class TraceExporter implements INodeType {
 		name: 'traceExporter',
 		icon: { light: 'file:traceExporter.svg', dark: 'file:traceExporter.dark.svg' },
 		group: ['transform'],
-		version: [1, 1.1],
+		// n8n stores the last light-version entry in the integer
+		// InstalledNodes.latestVersion database column for community packages.
+		// Keep 1.1 for workflows created with 0.1.5, but use integer 2 as current.
+		version: [1, 1.1, 2],
 		description:
 			'Export AI Agent model and tool traces to Opik, Langfuse, or an OpenTelemetry backend',
 		subtitle: '={{$parameter["traceName"]}}',

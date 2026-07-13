@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { TraceExporter } from '../dist/nodes/TraceExporter/TraceExporter.node.js';
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
@@ -191,7 +192,6 @@ test('description declares one required model input and one traced model output'
 
 test('description exposes observability search aliases without claiming tool support', () => {
 	const { description } = new TraceExporter();
-	assert.deepEqual(description.version, [1, 1.1]);
 	assert.equal(description.usableAsTool, undefined);
 	assert.equal(
 		description.properties.find((property) => property.name === 'metadata').validateType,
@@ -200,6 +200,21 @@ test('description exposes observability search aliases without claiming tool sup
 	for (const alias of ['LLM observability', 'OpenTelemetry', 'OTLP', 'Opik', 'Langfuse']) {
 		assert.ok(description.codex.alias.includes(alias), `missing picker alias: ${alias}`);
 	}
+});
+
+test('current node version is an integer that n8n can persist during community install', () => {
+	const { version } = new TraceExporter().description;
+	const metadata = JSON.parse(
+		readFileSync(
+			new URL('../dist/nodes/TraceExporter/TraceExporter.node.json', import.meta.url),
+			'utf8',
+		),
+	);
+	assert.deepEqual(version, [1, 1.1, 2], 'keep 1.1 workflows compatible while making 2 current');
+	const latestVersion = version.at(-1);
+	assert.equal(latestVersion, 2);
+	assert.equal(Number.isInteger(latestVersion), true, 'n8n persists the latest version as integer');
+	assert.equal(Number(metadata.nodeVersion), latestVersion, 'packaged metadata matches runtime');
 });
 
 test('node version 1.1 reads visible capture and grouped advanced settings', async () => {
