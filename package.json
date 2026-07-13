@@ -1,7 +1,7 @@
 {
 	"name": "n8n-nodes-observability",
-	"version": "0.1.4",
-	"description": "n8n community node that adds OpenTelemetry tracing to AI Agent workflows: insert the Trace Exporter between any Chat Model and the AI Agent to export LLM traces (tokens, cost, latency, prompts) to Comet Opik, Langfuse, Datadog, or any OTLP collector.",
+	"version": "0.1.5",
+	"description": "Export OpenTelemetry traces from n8n AI Agent workflows to Opik, Langfuse, or any OTLP/HTTP JSON collector. Captures model calls, tool calls, tokens, latency, and optional content.",
 	"license": "MIT",
 	"homepage": "https://github.com/krystianslowik/n8n-nodes-llm-observability",
 	"keywords": [

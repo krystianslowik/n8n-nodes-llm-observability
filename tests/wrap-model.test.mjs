@@ -37,7 +37,7 @@ const OPENAI_SERIALIZED = {
 // NOTE: wrapModelWithTracing keeps a module-level pipeline registry keyed on
 // (executionId, node name), so every test must use a UNIQUE execution id to
 // stay isolated from the others.
-function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
+function fakeCtx(httpCalls, logs = [], executionId = 'exec-7', hints = []) {
 	return {
 		helpers: {
 			httpRequest: async (options) => {
@@ -50,6 +50,7 @@ function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
 			error: (m) => logs.push(['error', m]),
 			debug: (m) => logs.push(['debug', m]),
 		},
+		addExecutionHints: (...values) => hints.push(...values),
 		getWorkflow: () => ({ id: 'wf-9', name: 'Spike WF', active: false }),
 		getExecutionId: () => executionId,
 		getNode: () => ({ name: 'Trace Exporter', id: 'node-1', type: 'traceExporter' }),
@@ -224,6 +225,52 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	assert.equal(resourceAttrs['service.version'], 'release-1');
 });
 
+test('execution feedback distinguishes sampled and queued without claiming delivery', () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	const returned = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-feedback-sampled'),
+		model,
+		OPTIONS,
+		CREDENTIAL,
+	);
+	assert.equal(returned.getTraceContext(), undefined, 'sampling is undecided before model start');
+
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	const started = returned.getTraceContext();
+	assert.equal(started.tracing, 'attached');
+	assert.equal(started.sampling, 'sampled');
+	assert.equal('exportStatus' in started, false, 'nothing is queued before a span ends');
+	assert.match(started.traceId, /^[0-9a-f]{32}$/);
+
+	handler.handleLLMEnd({}, 'run-1');
+	const ended = returned.getTraceContext();
+	assert.equal(ended.exportStatus, 'queued');
+	assert.equal('delivered' in ended, false, 'background export is never reported as delivered');
+});
+
+test('unsampled execution feedback exposes no trace IDs and sends no spans', () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	const returned = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-feedback-unsampled'),
+		model,
+		{ ...OPTIONS, samplingRatePercent: 0 },
+		CREDENTIAL,
+	);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+
+	assert.deepEqual(returned.getTraceContext(), {
+		tracing: 'attached',
+		sampling: 'notSampled',
+		exportStatus: 'notSampled',
+	});
+	assert.equal(httpCalls.length, 0);
+});
+
 test('configured redaction also sanitizes metadata and tags before they become searchable attributes', async () => {
 	const httpCalls = [];
 	const model = { callbacks: [] };
@@ -295,6 +342,81 @@ test('export failure is swallowed: no unhandled rejection, warning logged', asyn
 	} finally {
 		process.off('unhandledRejection', onUnhandled);
 	}
+});
+
+test('background export failures do not claim a persisted execution hint', async () => {
+	const logs = [];
+	const hints = [];
+	const ctx = fakeCtx([], logs, 'exec-export-hint', hints);
+	ctx.helpers.httpRequest = async () => {
+		throw Object.assign(new Error('secret backend response'), { httpCode: '401' });
+	};
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	assert.equal(
+		hints.length,
+		0,
+		'a detached HTTP failure can happen after addOutputData persisted the sub-node run',
+	);
+	assert.ok(
+		logs.some(([level, message]) => level === 'warn' && /secret backend response/.test(message)),
+	);
+});
+
+test('invalid redaction patterns and callback attachment failures add deduplicated hints', () => {
+	const hints = [];
+	const ctx = fakeCtx([], [], 'exec-configuration-hints', hints);
+	const model = { callbacks: {} };
+	wrapModelWithTracing(ctx, model, { ...OPTIONS, redactionPatterns: ['['] }, CREDENTIAL);
+	wrapModelWithTracing(ctx, { callbacks: {} }, OPTIONS, CREDENTIAL);
+
+	assert.equal(hints.filter((hint) => /redaction pattern/.test(hint.message)).length, 1);
+	assert.equal(hints.filter((hint) => /could not attach/.test(hint.message)).length, 1);
+});
+
+test('setup failures add one hint while preserving model passthrough', () => {
+	const hints = [];
+	const ctx = fakeCtx([], [], 'exec-setup-hint', hints);
+	const credential = {
+		authType: 'customHeaders',
+		get endpointUrl() {
+			throw new Error('broken credential value');
+		},
+	};
+	const modelA = { callbacks: [] };
+	const modelB = { callbacks: [] };
+	assert.equal(wrapModelWithTracing(ctx, modelA, OPTIONS, credential).model, modelA);
+	assert.equal(wrapModelWithTracing(ctx, modelB, OPTIONS, credential).model, modelB);
+	assert.equal(hints.filter((hint) => /setup failed/.test(hint.message)).length, 1);
+});
+
+test('queue overflow adds one execution hint while export remains non-blocking', async () => {
+	const hints = [];
+	let releasePost;
+	const gate = new Promise((resolve) => {
+		releasePost = resolve;
+	});
+	const ctx = fakeCtx([], [], 'exec-queue-hint', hints);
+	ctx.helpers.httpRequest = () => gate;
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+	for (let index = 0; index < 205; index++) {
+		const runId = `run-${index}`;
+		handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], runId);
+		handler.handleLLMEnd({}, runId);
+	}
+
+	assert.equal(hints.filter((hint) => /queue is full/.test(hint.message)).length, 1);
+	releasePost();
+	await flushMicrotasks();
 });
 
 test('wrapModelWithTracing never throws — broken ctx still returns the model', () => {

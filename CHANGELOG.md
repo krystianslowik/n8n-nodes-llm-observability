@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.5 - 2026-07-13
+
+### Added
+
+- Add Language Model picker aliases for observability, OpenTelemetry, OTLP,
+  Opik, Langfuse, and Datadog.
+- Add explicit sampled/not-sampled execution data, truthful background queue
+  status, and execution warnings for setup, redaction, and queue problems.
+
+### Changed
+
+- Rename the node to **AI Trace Exporter**, replace its icon, label both model
+  connections, and group privacy, trace attribute, and export settings in node
+  version 1.1 while preserving version 1 workflow parameters.
+- Replace the credential's preset form with guided backend setup and explicit,
+  backward-compatible endpoint authentication.
+- Document Datadog through an OpenTelemetry Collector; the Datadog site and API
+  key now stay on the collector's Datadog exporter instead of being sent to its
+  OTLP receiver.
+- Replace README ASCII diagrams with Mermaid and align all labels with the n8n
+  editor.
+
+### Fixed
+
+- Preserve explicit authentication on existing Langfuse, Opik, and collector
+  credentials instead of silently forcing a backend-specific mode.
+- Keep existing traced-model output fan-out valid while restricting the input
+  to one Chat Model.
+- Correct package metadata and documentation anchors used by n8n discovery.
+
 ## 0.1.4 - 2026-07-10
 
 ### Added
@@ -53,7 +83,7 @@ All notable changes to this project will be documented in this file.
 
 - **One agent execution is one trace again on n8n's steppable Tools Agent
   (V3, the current default).** n8n runs `supplyData` close hooks after every
-  agent *step*, not at execution end; previous versions evicted the
+  agent _step_, not at execution end; previous versions evicted the
   per-execution tracing pipeline there, splitting one run into one trace per
   LLM call and losing the pending tool-call ledger (so no tool spans). The
   close hook now only marks the pipeline; eviction happens lazily after a

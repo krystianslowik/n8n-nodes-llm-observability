@@ -1,17 +1,17 @@
 {
-	"node": "n8n-nodes-llm-observability",
+	"node": "n8n-nodes-observability",
 	"nodeVersion": "1.0",
 	"codexVersion": "1.0",
 	"categories": ["AI"],
 	"resources": {
 		"credentialDocumentation": [
 			{
-				"url": "https://github.com/krystianslowik/n8n-nodes-llm-observability?tab=readme-ov-file#credentials"
+				"url": "https://github.com/krystianslowik/n8n-nodes-llm-observability#setup"
 			}
 		],
 		"primaryDocumentation": [
 			{
-				"url": "https://github.com/krystianslowik/n8n-nodes-llm-observability?tab=readme-ov-file"
+				"url": "https://github.com/krystianslowik/n8n-nodes-llm-observability"
 			}
 		]
 	}

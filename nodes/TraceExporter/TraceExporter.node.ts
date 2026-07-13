@@ -8,7 +8,7 @@ import {
 
 import type { OtlpCredential } from './shared/otlpExport';
 import { createExecutionStateHandler } from './shared/n8nExecutionState';
-import type { ExecutionStateHandler } from './shared/n8nExecutionState';
+import type { ExecutionStateHandler, TraceExecutionContext } from './shared/n8nExecutionState';
 import {
 	attachHandler,
 	wrapModelWithTracing,
@@ -60,35 +60,37 @@ function attachExecutionStateHandler(model: unknown, handler: ExecutionStateHand
  * `INodeTypeDescription`, so everything else on `description` still gets
  * full type-checking.
  */
+// This middleware supplies an ai_languageModel connection; it cannot be attached as an AI tool.
+// eslint-disable-next-line @n8n/community-nodes/node-usable-as-tool
 export class TraceExporter implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'Trace Exporter',
+		displayName: 'AI Trace Exporter',
 		name: 'traceExporter',
 		icon: { light: 'file:traceExporter.svg', dark: 'file:traceExporter.dark.svg' },
 		group: ['transform'],
-		version: 1,
+		version: [1, 1.1],
 		description:
-			'Wraps a connected Chat Model with OpenTelemetry trace export (Langfuse, Comet Opik, Datadog, or any OTLP collector) without replacing the model or the AI Agent',
-		subtitle: '={{$parameter["traceName"] || "Trace Exporter"}}',
+			'Export AI Agent model and tool traces to Opik, Langfuse, or an OpenTelemetry backend',
+		subtitle: '={{$parameter["traceName"]}}',
 		defaults: {
-			name: 'Trace Exporter',
+			name: 'AI Trace Exporter',
 		},
-		// This is a middleware sub-node with `ai_languageModel` in/out (no
-		// `main` input/output) — an AI Agent can't attach it as a `tool` the way
-		// it would a regular node; it sits between the model and the agent
-		// instead. `UsableAsToolDescription`'s type doesn't accept `false`
-		// (only `true | UsableAsToolDescription | undefined`), and omitting the
-		// field trips `@n8n/community-nodes/node-usable-as-tool`'s "when in
-		// doubt, set it to true" default. `true` here is a lint-rule
-		// accommodation, not an assertion that this sub-node is meaningfully
-		// tool-usable — same resolution the sibling `n8n-nodes-pdf` package
-		// uses for its own not-quite-fitting case.
-		usableAsTool: true,
 		codex: {
 			categories: ['AI'],
 			subcategories: {
 				AI: ['Language Models'],
 			},
+			alias: [
+				'AI observability',
+				'LLM observability',
+				'OpenTelemetry',
+				'OTel',
+				'OTLP',
+				'tracing',
+				'Langfuse',
+				'Opik',
+				'Datadog',
+			],
 		},
 		// See the class-level comment above (PRD §7): `AiLanguageModel`
 		// is a valid runtime `NodeConnectionType`, but community-node public
@@ -97,9 +99,20 @@ export class TraceExporter implements INodeType {
 		// exactly one model; a bare-string entry would allow unlimited
 		// connections (and make getInputConnectionData return an array).
 		inputs: [
-			{ type: NodeConnectionTypes.AiLanguageModel, maxConnections: 1 },
+			{
+				type: NodeConnectionTypes.AiLanguageModel,
+				displayName: 'Chat Model',
+				required: true,
+				maxConnections: 1,
+			},
 		] as INodeTypeDescription['inputs'],
-		outputs: [NodeConnectionTypes.AiLanguageModel] as INodeTypeDescription['outputs'],
+		outputs: [
+			{
+				type: NodeConnectionTypes.AiLanguageModel,
+				displayName: 'Traced Chat Model',
+			},
+		] as INodeTypeDescription['outputs'],
+		requiredInputs: 1,
 		credentials: [
 			{
 				name: 'otlpExporterApi',
@@ -108,34 +121,79 @@ export class TraceExporter implements INodeType {
 		],
 		properties: [
 			{
+				displayName: 'Connect one Chat Model to the input, then connect the output to an AI Agent',
+				name: 'connectionNotice',
+				type: 'notice',
+				default: '',
+			},
+			{
 				displayName: 'Trace Name',
 				name: 'traceName',
 				type: 'string',
 				default: '',
 				placeholder: 'e.g. support-agent-run',
-				description: 'Name attached to the trace emitted for each agent execution (PRD F4)',
+				description: 'Name shown for the root trace. Leave empty to use "n8n agent execution".',
 			},
 			{
 				displayName: 'Session ID',
 				name: 'sessionId',
 				type: 'string',
 				default: '',
-				description:
-					'Groups multiple traces into one conversation/session in the observability backend. Expression-friendly — e.g. reference a chat session ID from earlier in the workflow.',
+				description: 'Stable conversation ID used to group related executions',
 			},
 			{
 				displayName: 'User ID',
 				name: 'userId',
 				type: 'string',
 				default: '',
-				description: 'End-user identifier attached to the trace, for per-user cost/usage breakdowns in the backend',
+				description: 'End-user identifier attached to the trace',
 			},
 			{
-				displayName: 'Custom Metadata',
+				displayName: 'Metadata',
 				name: 'metadata',
 				type: 'json',
+				validateType: 'object',
 				default: '{}',
-				description: 'Arbitrary JSON object attached to every trace emitted by this node',
+				description: 'JSON object attached to every exported trace',
+			},
+			{
+				displayName: 'Include Prompts and Responses',
+				name: 'capturePrompts',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to export model prompts and responses. These can contain sensitive data.',
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+					},
+				},
+			},
+			{
+				displayName: 'Include Tool Inputs and Outputs',
+				name: 'captureToolIO',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to export tool inputs and outputs. These can contain sensitive data.',
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+					},
+				},
+			},
+			{
+				displayName:
+					'Content capture is off by default. Token counts, latency, model details, errors, and trace context are still exported.',
+				name: 'contentCaptureNotice',
+				type: 'notice',
+				default: '',
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+						capturePrompts: [false],
+						captureToolIO: [false],
+					},
+				},
 			},
 			{
 				displayName: 'Options',
@@ -143,22 +201,12 @@ export class TraceExporter implements INodeType {
 				type: 'collection',
 				placeholder: 'Add Option',
 				default: {},
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { lte: 1 } }],
+					},
+				},
 				options: [
-					{
-						displayName: 'Capture Prompts/Completions',
-						name: 'capturePrompts',
-						type: 'boolean',
-						default: false,
-						description:
-							'Whether to include full prompt/completion text in exported spans. Off by default (PRD R5: sensitive prompt data must not leave the instance unless explicitly opted in).',
-					},
-					{
-						displayName: 'Capture Tool I/O',
-						name: 'captureToolIO',
-						type: 'boolean',
-						default: false,
-						description: 'Whether to include tool call inputs/outputs in exported spans. Off by default for the same privacy reason as prompt/completion capture.',
-					},
 					{
 						displayName: 'Environment',
 						name: 'environment',
@@ -168,11 +216,28 @@ export class TraceExporter implements INodeType {
 						description: 'Deployment environment used to filter and compare traces',
 					},
 					{
+						displayName: 'Include Prompts and Responses',
+						name: 'capturePrompts',
+						type: 'boolean',
+						default: false,
+						description:
+							'Whether to export model prompts and responses. These can contain sensitive data.',
+					},
+					{
+						displayName: 'Include Tool Inputs and Outputs',
+						name: 'captureToolIO',
+						type: 'boolean',
+						default: false,
+						description:
+							'Whether to export tool inputs and outputs. These can contain sensitive data.',
+					},
+					{
 						displayName: 'Max Payload Size (KB)',
 						name: 'maxPayloadSizeKb',
 						type: 'number',
+						typeOptions: { minValue: 1 },
 						default: 32,
-						description: 'Prompt/completion/tool payloads larger than this are truncated before export (PRD §5 "max payload size + truncation")',
+						description: 'Captured content larger than this is truncated before export',
 					},
 					{
 						displayName: 'Redaction Patterns',
@@ -181,14 +246,15 @@ export class TraceExporter implements INodeType {
 						typeOptions: { multipleValues: true },
 						default: [],
 						placeholder: 'e.g. \\b\\d{16}\\b or /secret-[a-z0-9]+/gi',
-						description: 'JavaScript regular expressions applied to every captured payload, error, tag, and metadata value before export; matches become [REDACTED]',
+						description:
+							'JavaScript regular expressions applied to every captured payload, error, tag, and metadata value before export; matches become [REDACTED]',
 					},
 					{
 						displayName: 'Release',
 						name: 'release',
 						type: 'string',
 						default: '',
-						placeholder: 'e.g. 2026.07.10',
+						placeholder: 'e.g. 1.4.2 or a1b2c3d',
 						description: 'Application release or deployment version attached to traces',
 					},
 					{
@@ -197,7 +263,7 @@ export class TraceExporter implements INodeType {
 						type: 'number',
 						typeOptions: { minValue: 0, maxValue: 100 },
 						default: 100,
-						description: 'Percentage of traces to export; the rest are dropped before ever leaving the process (PRD §5 "Sampling rate (0-100%)")',
+						description: 'Percentage of traces to queue for export',
 					},
 					{
 						displayName: 'Service Name',
@@ -218,7 +284,108 @@ export class TraceExporter implements INodeType {
 				],
 			},
 			{
-				displayName: 'Export runs asynchronously in the background and never blocks or fails the workflow — a slow or unreachable observability backend only results in dropped trace data, never a failed node (PRD §5 failure policy, §6 non-functional requirements)',
+				displayName: 'Privacy Options',
+				name: 'privacyOptions',
+				type: 'collection',
+				placeholder: 'Add Privacy Option',
+				default: {},
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+					},
+				},
+				options: [
+					{
+						displayName: 'Max Captured Content Size (KB)',
+						name: 'maxPayloadSizeKb',
+						type: 'number',
+						typeOptions: { minValue: 1 },
+						default: 32,
+						description: 'Captured content larger than this is truncated before export',
+					},
+					{
+						displayName: 'Redaction Patterns',
+						name: 'redactionPatterns',
+						type: 'string',
+						typeOptions: { multipleValues: true },
+						default: [],
+						placeholder: 'e.g. \\b\\d{16}\\b or /secret-[a-z0-9]+/gi',
+						description:
+							'JavaScript regular expressions applied before export; matches become [REDACTED]',
+					},
+				],
+			},
+			{
+				displayName: 'Trace Attributes',
+				name: 'traceAttributes',
+				type: 'collection',
+				placeholder: 'Add Trace Attribute',
+				default: {},
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+					},
+				},
+				options: [
+					{
+						displayName: 'Environment',
+						name: 'environment',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. production',
+						description: 'Deployment environment used to filter and compare traces',
+					},
+					{
+						displayName: 'Release',
+						name: 'release',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. 1.4.2 or a1b2c3d',
+						description: 'Application release or deployment identifier',
+					},
+					{
+						displayName: 'Service Name',
+						name: 'serviceName',
+						type: 'string',
+						default: 'n8n',
+						description: 'Value used for the OpenTelemetry service.name attribute',
+					},
+					{
+						displayName: 'Tags',
+						name: 'tags',
+						type: 'string',
+						typeOptions: { multipleValues: true },
+						default: [],
+						placeholder: 'e.g. support or experiment-a',
+						description: 'Searchable labels attached to every span and trace',
+					},
+				],
+			},
+			{
+				displayName: 'Export Options',
+				name: 'exportOptions',
+				type: 'collection',
+				placeholder: 'Add Export Option',
+				default: {},
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
+					},
+				},
+				options: [
+					{
+						displayName: 'Sampling Rate (%)',
+						name: 'samplingRatePercent',
+						type: 'number',
+						typeOptions: { minValue: 0, maxValue: 100 },
+						default: 100,
+						description: 'Percentage of traces to queue for export',
+					},
+				],
+			},
+			{
+				displayName:
+					'Trace export runs in the background. A successful workflow run does not confirm that the backend accepted the trace.',
 				name: 'exportNotice',
 				type: 'notice',
 				default: '',
@@ -232,10 +399,13 @@ export class TraceExporter implements INodeType {
 		// defensive fallback for older n8n versions that still hand back an
 		// ARRAY (measured live in the spike: attaching to the array traces
 		// nothing).
-		const supplied = await this.getInputConnectionData(NodeConnectionTypes.AiLanguageModel, itemIndex);
+		const supplied = await this.getInputConnectionData(
+			NodeConnectionTypes.AiLanguageModel,
+			itemIndex,
+		);
 		const model = Array.isArray(supplied) ? (supplied[0] as unknown) : supplied;
 		const traceContextBox: {
-			current?: () => { traceId: string; rootSpanId: string } | undefined;
+			current?: () => TraceExecutionContext | undefined;
 		} = {};
 		// `supplyData()` itself does not create run data in n8n. A fresh,
 		// step-local callback reports model start/end/error through
@@ -259,7 +429,8 @@ export class TraceExporter implements INodeType {
 			// UI execution state is best-effort and must never block model passthrough.
 		}
 
-		const options = this.getNodeParameter('options', itemIndex, {}) as {
+		const nodeVersion = this.getNode().typeVersion ?? 1;
+		const legacyOptions = this.getNodeParameter('options', itemIndex, {}) as {
 			capturePrompts?: boolean;
 			captureToolIO?: boolean;
 			maxPayloadSizeKb?: number;
@@ -271,20 +442,56 @@ export class TraceExporter implements INodeType {
 			serviceName?: string;
 		};
 
+		let capturePrompts = legacyOptions.capturePrompts ?? false;
+		let captureToolIO = legacyOptions.captureToolIO ?? false;
+		let maxPayloadSizeKb = legacyOptions.maxPayloadSizeKb ?? 32;
+		let samplingRatePercent = legacyOptions.samplingRatePercent ?? 100;
+		let redactionPatterns = legacyOptions.redactionPatterns ?? [];
+		let environment = legacyOptions.environment ?? '';
+		let tags = legacyOptions.tags ?? [];
+		let release = legacyOptions.release ?? '';
+		let serviceName = legacyOptions.serviceName ?? 'n8n';
+
+		if (nodeVersion >= 1.1) {
+			const privacyOptions = this.getNodeParameter('privacyOptions', itemIndex, {}) as {
+				maxPayloadSizeKb?: number;
+				redactionPatterns?: string[];
+			};
+			const traceAttributes = this.getNodeParameter('traceAttributes', itemIndex, {}) as {
+				environment?: string;
+				tags?: string[];
+				release?: string;
+				serviceName?: string;
+			};
+			const exportOptions = this.getNodeParameter('exportOptions', itemIndex, {}) as {
+				samplingRatePercent?: number;
+			};
+
+			capturePrompts = this.getNodeParameter('capturePrompts', itemIndex, false) as boolean;
+			captureToolIO = this.getNodeParameter('captureToolIO', itemIndex, false) as boolean;
+			maxPayloadSizeKb = privacyOptions.maxPayloadSizeKb ?? 32;
+			redactionPatterns = privacyOptions.redactionPatterns ?? [];
+			environment = traceAttributes.environment ?? '';
+			tags = traceAttributes.tags ?? [];
+			release = traceAttributes.release ?? '';
+			serviceName = traceAttributes.serviceName ?? 'n8n';
+			samplingRatePercent = exportOptions.samplingRatePercent ?? 100;
+		}
+
 		const traceExporterOptions: TraceExporterOptions = {
 			traceName: this.getNodeParameter('traceName', itemIndex, '') as string,
 			sessionId: this.getNodeParameter('sessionId', itemIndex, '') as string,
 			userId: this.getNodeParameter('userId', itemIndex, '') as string,
 			metadata: this.getNodeParameter('metadata', itemIndex, {}),
-			capturePrompts: options.capturePrompts ?? false,
-			captureToolIO: options.captureToolIO ?? false,
-			maxPayloadSizeKb: options.maxPayloadSizeKb ?? 32,
-			samplingRatePercent: options.samplingRatePercent ?? 100,
-			redactionPatterns: options.redactionPatterns ?? [],
-			environment: options.environment ?? '',
-			tags: options.tags ?? [],
-			release: options.release ?? '',
-			serviceName: options.serviceName ?? 'n8n',
+			capturePrompts,
+			captureToolIO,
+			maxPayloadSizeKb,
+			samplingRatePercent,
+			redactionPatterns,
+			environment,
+			tags,
+			release,
+			serviceName,
 			itemIndex,
 		};
 
@@ -293,12 +500,11 @@ export class TraceExporter implements INodeType {
 			itemIndex,
 		)) as unknown as OtlpCredential;
 
-		const { model: wrappedModel, closeFunction, getTraceContext } = wrapModelWithTracing(
-			this,
-			model,
-			traceExporterOptions,
-			credential,
-		);
+		const {
+			model: wrappedModel,
+			closeFunction,
+			getTraceContext,
+		} = wrapModelWithTracing(this, model, traceExporterOptions, credential);
 		traceContextBox.current = getTraceContext;
 
 		return closeFunction ? { response: wrappedModel, closeFunction } : { response: wrappedModel };
