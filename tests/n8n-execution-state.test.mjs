@@ -42,16 +42,25 @@ test('execution-state handler pairs addInputData/addOutputData and keeps content
 	assert.equal(inputCalls.length, 1, 'one n8n run is opened per LangChain runId');
 	assert.equal(inputCalls[0][0], 'ai_languageModel');
 	assert.deepEqual(inputCalls[0][1], [[{ json: { provider: 'openai', model: 'gpt-4o-mini' } }]]);
-	assert.ok(!JSON.stringify(inputCalls).includes('private prompt'), 'prompt text is not duplicated into UI state');
+	assert.ok(
+		!JSON.stringify(inputCalls).includes('private prompt'),
+		'prompt text is not duplicated into UI state',
+	);
 
 	const output = {
-		generations: [[{ text: 'private completion', message: { tool_calls: [{ name: 'secret-tool' }] } }]],
+		generations: [
+			[{ text: 'private completion', message: { tool_calls: [{ name: 'secret-tool' }] } }],
+		],
 		llmOutput: { tokenUsage: { promptTokens: 12, completionTokens: 3 } },
 	};
 	const before = JSON.stringify(output);
 	handler.handleLLMEnd(output, 'run-1');
 
-	assert.equal(JSON.stringify(output), before, 'execution reporting never mutates the shared provider result');
+	assert.equal(
+		JSON.stringify(output),
+		before,
+		'execution reporting never mutates the shared provider result',
+	);
 	assert.equal(outputCalls.length, 1);
 	assert.equal(outputCalls[0][0], 'ai_languageModel');
 	assert.equal(outputCalls[0][1], 4, 'completion closes the exact index returned at start');
@@ -113,7 +122,13 @@ test('execution-state reporting is best-effort and never throws when n8n bookkee
 
 test('execution-state data exposes trace and root span IDs for backend correlation', () => {
 	const { ctx, inputCalls, outputCalls } = fakeCtx();
-	const traceContext = { traceId: 'a'.repeat(32), rootSpanId: 'b'.repeat(16) };
+	const traceContext = {
+		tracing: 'attached',
+		sampling: 'sampled',
+		exportStatus: 'queued',
+		traceId: 'a'.repeat(32),
+		rootSpanId: 'b'.repeat(16),
+	};
 	const handler = createExecutionStateHandler(ctx, () => traceContext);
 
 	handler.handleLLMStart(LLM, [], 'run-1');
@@ -123,4 +138,26 @@ test('execution-state data exposes trace and root span IDs for backend correlati
 	assert.equal(inputCalls[0][1][0][0].json.rootSpanId, traceContext.rootSpanId);
 	assert.equal(outputCalls[0][2][0][0].json.traceId, traceContext.traceId);
 	assert.equal(outputCalls[0][2][0][0].json.rootSpanId, traceContext.rootSpanId);
+	assert.equal(outputCalls[0][2][0][0].json.sampling, 'sampled');
+	assert.equal(outputCalls[0][2][0][0].json.exportStatus, 'queued');
+});
+
+test('execution-state data reports unsampled runs without correlation IDs', () => {
+	const { ctx, inputCalls, outputCalls } = fakeCtx();
+	const handler = createExecutionStateHandler(ctx, () => ({
+		tracing: 'attached',
+		sampling: 'notSampled',
+		exportStatus: 'notSampled',
+	}));
+
+	handler.handleLLMStart(LLM, [], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+
+	for (const json of [inputCalls[0][1][0][0].json, outputCalls[0][2][0][0].json]) {
+		assert.equal(json.tracing, 'attached');
+		assert.equal(json.sampling, 'notSampled');
+		assert.equal(json.exportStatus, 'notSampled');
+		assert.equal('traceId' in json, false);
+		assert.equal('rootSpanId' in json, false);
+	}
 });

@@ -1,6 +1,7 @@
 import type { ISupplyDataFunctions } from 'n8n-workflow';
 
 import type { TracingHooks } from './callbackTypes';
+import type { TraceExecutionContext } from './n8nExecutionState';
 import { buildExportTarget, SpanExporter } from './otlpExport';
 import type { OtlpCredential } from './otlpExport';
 import type { OtlpAttrValue } from './otlpJson';
@@ -162,9 +163,7 @@ function collectBaseAttributes(
 			let value: string;
 			try {
 				value =
-					typeof rawValue === 'string'
-						? rawValue
-						: (JSON.stringify(rawValue) ?? String(rawValue));
+					typeof rawValue === 'string' ? rawValue : (JSON.stringify(rawValue) ?? String(rawValue));
 			} catch {
 				try {
 					value = String(rawValue);
@@ -212,7 +211,7 @@ interface PipelineEntry {
 	handler: TracingHooks;
 	finalize: (atMs?: number) => void;
 	retryPendingRoot: () => void;
-	getTraceContext: () => { traceId: string; rootSpanId: string } | undefined;
+	getTraceContext: () => TraceExecutionContext | undefined;
 	/** Set at every closeFunction, cleared when a later step reuses the entry. */
 	closedAt?: number;
 }
@@ -220,6 +219,77 @@ interface PipelineEntry {
 const pipelineByExecution = new Map<string, PipelineEntry>();
 const MAX_PIPELINES = 200;
 export const PIPELINE_LINGER_MS = 10 * 60_000;
+
+type ExecutionHintKey =
+	| 'callbackAttachFailed'
+	| 'invalidRedactionPattern'
+	| 'queueOverflow'
+	| 'setupFailed';
+
+interface ExecutionFeedback {
+	ctx: ISupplyDataFunctions;
+	hints: Set<ExecutionHintKey>;
+	queued: boolean;
+}
+
+const feedbackByExecution = new Map<string, ExecutionFeedback>();
+
+function createExecutionFeedback(ctx: ISupplyDataFunctions): ExecutionFeedback {
+	return { ctx, hints: new Set(), queued: false };
+}
+
+function feedbackForExecution(
+	ctx: ISupplyDataFunctions,
+	registryKey: string | undefined,
+): ExecutionFeedback {
+	if (!registryKey) return createExecutionFeedback(ctx);
+	const existing = feedbackByExecution.get(registryKey);
+	if (existing) {
+		existing.ctx = ctx;
+		return existing;
+	}
+	if (feedbackByExecution.size >= MAX_PIPELINES) {
+		const oldest = feedbackByExecution.keys().next().value;
+		if (oldest !== undefined) feedbackByExecution.delete(oldest);
+	}
+	const feedback = createExecutionFeedback(ctx);
+	feedbackByExecution.set(registryKey, feedback);
+	return feedback;
+}
+
+function addExecutionHintOnce(
+	feedback: ExecutionFeedback,
+	key: ExecutionHintKey,
+	message: string,
+): void {
+	if (feedback.hints.has(key)) return;
+	try {
+		if (typeof feedback.ctx.addExecutionHints !== 'function') return;
+		feedback.ctx.addExecutionHints({ message, type: 'warning', location: 'outputPane' });
+		feedback.hints.add(key);
+	} catch {
+		// Execution feedback is best-effort and must never affect the model.
+	}
+}
+
+function traceExecutionContext(
+	tracker: RunTreeTracker,
+	feedback: ExecutionFeedback,
+): TraceExecutionContext | undefined {
+	const sampled = tracker.getSamplingDecision();
+	if (sampled === undefined) return undefined;
+	if (!sampled) {
+		return { tracing: 'attached', sampling: 'notSampled', exportStatus: 'notSampled' };
+	}
+	const context = tracker.getTraceContext();
+	if (!context) return undefined;
+	return {
+		tracing: 'attached',
+		sampling: 'sampled',
+		...context,
+		...(feedback.queued ? { exportStatus: 'queued' as const } : {}),
+	};
+}
 
 /**
  * Finalize + evict every entry that has stayed closed past the linger window.
@@ -236,6 +306,7 @@ export function sweepStalePipelines(nowMs: number, skipKey?: string): void {
 			/* never break the workflow */
 		}
 		pipelineByExecution.delete(key);
+		feedbackByExecution.delete(key);
 	}
 }
 
@@ -265,7 +336,7 @@ function buildCloseFunction(registryKey: string): () => Promise<void> {
 export interface WrappedModel {
 	model: unknown;
 	closeFunction?: () => Promise<void>;
-	getTraceContext?: () => { traceId: string; rootSpanId: string } | undefined;
+	getTraceContext?: () => TraceExecutionContext | undefined;
 }
 
 /**
@@ -281,6 +352,7 @@ export function wrapModelWithTracing(
 	options: TraceExporterOptions,
 	credential: OtlpCredential,
 ): WrappedModel {
+	let feedback = createExecutionFeedback(ctx);
 	try {
 		let registryKey: string | undefined;
 		try {
@@ -289,12 +361,18 @@ export function wrapModelWithTracing(
 			registryKey = undefined;
 		}
 		sweepStalePipelines(Date.now(), registryKey);
+		feedback = feedbackForExecution(ctx, registryKey);
 		const existing = registryKey ? pipelineByExecution.get(registryKey) : undefined;
 		if (existing && registryKey) {
 			// A later agent step of the same execution: the entry stays live and
 			// the earlier closeFunction's mark is void (see the registry doc).
 			existing.closedAt = undefined;
 			if (!attachHandler(model, existing.handler)) {
+				addExecutionHintOnce(
+					feedback,
+					'callbackAttachFailed',
+					'Tracing could not attach to the supplied Chat Model. The model ran without observability. Connect a supported Chat Model directly to this node.',
+				);
 				try {
 					ctx.logger.warn(
 						'[TraceExporter] could not attach tracing callbacks to the supplied model; passing it through untraced',
@@ -315,6 +393,11 @@ export function wrapModelWithTracing(
 			Array.isArray(options.redactionPatterns) ? options.redactionPatterns : [],
 		);
 		if (redactor.invalidPatternCount > 0) {
+			addExecutionHintOnce(
+				feedback,
+				'invalidRedactionPattern',
+				`${redactor.invalidPatternCount} redaction pattern(s) were invalid and ignored. Fix or remove them before relying on content redaction.`,
+			);
 			try {
 				ctx.logger.warn(
 					`[TraceExporter] ignored ${redactor.invalidPatternCount} invalid redaction pattern(s)`,
@@ -348,7 +431,16 @@ export function wrapModelWithTracing(
 					/* never break the workflow */
 				}
 			},
-			(spans, statusCode) => trackerBox.current?.notifyExportFailed(spans, statusCode),
+			(spans, statusCode) => {
+				trackerBox.current?.notifyExportFailed(spans, statusCode);
+			},
+			() => {
+				addExecutionHintOnce(
+					feedback,
+					'queueOverflow',
+					'The trace export queue is full and some spans were dropped. Check the observability backend availability and response time.',
+				);
+			},
 		);
 		const tracker = new RunTreeTracker(
 			{
@@ -358,7 +450,8 @@ export function wrapModelWithTracing(
 				// byte comparison then fails and EVERYTHING truncates to the bare
 				// marker. Fall back to the option's 32 KB default instead.
 				maxPayloadBytes:
-					(Number.isFinite(options.maxPayloadSizeKb) ? Math.max(1, options.maxPayloadSizeKb) : 32) * 1024,
+					(Number.isFinite(options.maxPayloadSizeKb) ? Math.max(1, options.maxPayloadSizeKb) : 32) *
+					1024,
 				samplingRatePercent: options.samplingRatePercent,
 				singleTrace: true,
 				rootSpanName: options.traceName || 'n8n agent execution',
@@ -374,7 +467,10 @@ export function wrapModelWithTracing(
 					}
 				},
 			},
-			(span) => exporter.add(span),
+			(span) => {
+				feedback.queued = true;
+				exporter.add(span);
+			},
 		);
 		trackerBox.current = tracker;
 		const handler = tracker.createHandler();
@@ -401,17 +497,25 @@ export function wrapModelWithTracing(
 				} else {
 					evictKey = pipelineByExecution.keys().next().value;
 				}
-				if (evictKey !== undefined) pipelineByExecution.delete(evictKey);
+				if (evictKey !== undefined) {
+					pipelineByExecution.delete(evictKey);
+					feedbackByExecution.delete(evictKey);
+				}
 			}
 			pipelineByExecution.set(registryKey, {
 				handler,
 				finalize: (atMs?: number) => tracker.finalize(atMs),
 				retryPendingRoot: () => tracker.retryPendingRoot(),
-				getTraceContext: () => tracker.getTraceContext(),
+				getTraceContext: () => traceExecutionContext(tracker, feedback),
 			});
 		}
 		const attached = attachHandler(model, handler);
 		if (!attached) {
+			addExecutionHintOnce(
+				feedback,
+				'callbackAttachFailed',
+				'Tracing could not attach to the supplied Chat Model. The model ran without observability. Connect a supported Chat Model directly to this node.',
+			);
 			try {
 				ctx.logger.warn(
 					'[TraceExporter] could not attach tracing callbacks to the supplied model; passing it through untraced',
@@ -423,11 +527,18 @@ export function wrapModelWithTracing(
 		return {
 			model,
 			closeFunction: registryKey ? buildCloseFunction(registryKey) : undefined,
-			getTraceContext: () => tracker.getTraceContext(),
+			getTraceContext: () => traceExecutionContext(tracker, feedback),
 		};
 	} catch (error) {
+		addExecutionHintOnce(
+			feedback,
+			'setupFailed',
+			'Tracing setup failed and the model ran without observability. Check the OTLP credential and Trace Exporter settings.',
+		);
 		try {
-			ctx.logger.warn(`[TraceExporter] tracing setup failed, passing model through: ${String(error)}`);
+			ctx.logger.warn(
+				`[TraceExporter] tracing setup failed, passing model through: ${String(error)}`,
+			);
 		} catch {
 			/* never break the workflow */
 		}

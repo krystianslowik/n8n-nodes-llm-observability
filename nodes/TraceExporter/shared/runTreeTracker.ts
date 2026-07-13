@@ -222,6 +222,11 @@ export class RunTreeTracker {
 		};
 	}
 
+	/** Sampling decision for the shared trace; undefined until the first model run starts. */
+	getSamplingDecision(): boolean | undefined {
+		return this.sharedTrace?.sampled;
+	}
+
 	/**
 	 * Emit the shared trace's synthetic root once the final model answer is
 	 * known. Child spans are deliberately allowed to export first: live Opik
@@ -640,10 +645,7 @@ export class RunTreeTracker {
 				'gen_ai.request.temperature': numberParam('temperature'),
 				'gen_ai.request.max_tokens': numberParam('max_tokens', 'maxTokens'),
 				'gen_ai.request.top_p': numberParam('top_p', 'topP'),
-				'gen_ai.request.frequency_penalty': numberParam(
-					'frequency_penalty',
-					'frequencyPenalty',
-				),
+				'gen_ai.request.frequency_penalty': numberParam('frequency_penalty', 'frequencyPenalty'),
 				'gen_ai.request.presence_penalty': numberParam('presence_penalty', 'presencePenalty'),
 				'gen_ai.request.stop_sequences': stopSequences,
 				'gen_ai.input.messages': capturedInput,

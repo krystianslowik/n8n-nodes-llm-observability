@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import {
 	buildExportRequest,
 	generateSpanId,
@@ -8,6 +9,9 @@ import {
 	toOtlpAttributes,
 	SPAN_KIND_CLIENT,
 } from '../dist/nodes/TraceExporter/shared/otlpJson.js';
+
+const require = createRequire(import.meta.url);
+const packageMetadata = require('../package.json');
 
 test('generateTraceId returns 32 lowercase hex chars, unique per call', () => {
 	const a = generateTraceId();
@@ -40,7 +44,9 @@ test('toOtlpAttributes wraps values in OTLP envelopes and skips undefined', () =
 		{ key: 'gen_ai.temperature', value: { doubleValue: 0.7 } },
 		{
 			key: 'tags',
-			value: { arrayValue: { values: [{ stringValue: 'production' }, { stringValue: 'support' }] } },
+			value: {
+				arrayValue: { values: [{ stringValue: 'production' }, { stringValue: 'support' }] },
+			},
 		},
 	]);
 });
@@ -65,7 +71,7 @@ test('buildExportRequest produces the OTLP ExportTraceServiceRequest shape', () 
 				},
 				scopeSpans: [
 					{
-						scope: { name: 'n8n-nodes-observability', version: '0.1.4' },
+						scope: { name: packageMetadata.name, version: packageMetadata.version },
 						spans: [{ ...span, flags: 1 }],
 					},
 				],

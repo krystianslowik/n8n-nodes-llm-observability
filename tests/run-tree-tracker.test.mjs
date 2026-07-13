@@ -123,6 +123,7 @@ test('trace context becomes available after the first model start without creati
 	assert.equal(tracker.getTraceContext(), undefined);
 	tracker.createHandler().handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
 	const context = tracker.getTraceContext();
+	assert.equal(tracker.getSamplingDecision(), true);
 	assert.match(context.traceId, /^[0-9a-f]{32}$/);
 	assert.match(context.rootSpanId, /^[0-9a-f]{16}$/);
 });
@@ -214,7 +215,9 @@ test('LLM error closes the span with ERROR status', () => {
 
 test('a failed LLM marks both the child and synthetic agent root as errors', () => {
 	const spans = [];
-	const tracker = new RunTreeTracker({ ...baseConfig, singleTrace: true }, (span) => spans.push(span));
+	const tracker = new RunTreeTracker({ ...baseConfig, singleTrace: true }, (span) =>
+		spans.push(span),
+	);
 	const handler = tracker.createHandler();
 	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
 	handler.handleLLMError(new TypeError('provider exploded'), 'run-1');
@@ -251,14 +254,16 @@ test('tool start/end emits a span; input/output only with captureToolIO', () => 
 
 test('samplingRatePercent=0 suppresses emission but still records events', () => {
 	const spans = [];
-	const tracker = new RunTreeTracker({ ...baseConfig, samplingRatePercent: 0 }, (s) =>
-		spans.push(s),
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, samplingRatePercent: 0, singleTrace: true },
+		(s) => spans.push(s),
 	);
 	const handler = tracker.createHandler();
 	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1', 'agent-run');
 	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
 	assert.equal(spans.length, 0);
 	assert.equal(tracker.events.length, 2);
+	assert.equal(tracker.getSamplingDecision(), false);
 });
 
 test('every hook records an event and never throws, even on garbage input', () => {

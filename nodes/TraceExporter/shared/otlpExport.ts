@@ -5,7 +5,7 @@ import type { OtlpAttrValue, OtlpSpan } from './otlpJson';
 export interface OtlpCredential {
 	endpointUrl: string;
 	preset?: 'langfuse' | 'opik' | 'datadog' | 'custom';
-	authType: 'basicAuth' | 'apiKeyHeader' | 'customHeaders';
+	authType?: 'backendDefault' | 'basicAuth' | 'apiKeyHeader' | 'customHeaders';
 	username?: string;
 	password?: string;
 	apiKey?: string;
@@ -14,6 +14,31 @@ export interface OtlpCredential {
 	opikWorkspace?: string;
 	opikProjectName?: string;
 	datadogMlApp?: string;
+}
+
+export type ResolvedAuthType = 'basicAuth' | 'apiKeyHeader' | 'customHeaders';
+
+/**
+ * Keep authentication explicit and backward compatible. Existing credentials
+ * retain their stored authType; only the new Backend Default choice derives a
+ * mode from the selected backend. Missing authType uses the pre-0.1.5 defaults.
+ */
+export function resolveAuthType(credential: OtlpCredential): ResolvedAuthType {
+	if (credential.authType && credential.authType !== 'backendDefault') return credential.authType;
+	if (credential.authType === undefined) {
+		if (credential.preset === 'opik') return 'apiKeyHeader';
+		return 'basicAuth';
+	}
+	if (credential.preset === 'langfuse') return 'basicAuth';
+	if (credential.preset === 'opik') return 'apiKeyHeader';
+	return 'customHeaders';
+}
+
+export function resolveApiKeyHeaderName(credential: OtlpCredential): string {
+	if (credential.authType === 'backendDefault' && credential.preset === 'opik') {
+		return 'Authorization';
+	}
+	return credential.headerName || 'Authorization';
 }
 
 /** Parse only primitive header values; objects cannot be valid HTTP headers. */
@@ -36,7 +61,7 @@ export function parseAdditionalHeaders(raw: unknown): Record<string, string> {
 	return headers;
 }
 
-/** Headers required by each vendor's current OTLP intake contract. */
+/** Routing headers required by backends that accept this node's OTLP/JSON directly. */
 export function presetHeaders(credential: OtlpCredential): Record<string, string> {
 	if (credential.preset === 'langfuse') {
 		return { 'x-langfuse-ingestion-version': '4' };
@@ -45,12 +70,6 @@ export function presetHeaders(credential: OtlpCredential): Record<string, string
 		return {
 			...(credential.opikWorkspace ? { 'Comet-Workspace': credential.opikWorkspace } : {}),
 			...(credential.opikProjectName ? { projectName: credential.opikProjectName } : {}),
-		};
-	}
-	if (credential.preset === 'datadog') {
-		return {
-			'dd-otlp-source': 'llmobs',
-			'dd-ml-app': credential.datadogMlApp || 'n8n',
 		};
 	}
 	return {};
@@ -73,13 +92,15 @@ export function buildExportTarget(credential: OtlpCredential): {
 		'Content-Type': 'application/json',
 		...presetHeaders(credential),
 	};
-	if (credential.authType === 'basicAuth') {
+	const authType = resolveAuthType(credential);
+	if (authType === 'basicAuth') {
 		const token = Buffer.from(`${credential.username ?? ''}:${credential.password ?? ''}`).toString(
 			'base64',
 		);
 		headers.Authorization = `Basic ${token}`;
-	} else if (credential.authType === 'apiKeyHeader') {
-		if (credential.apiKey) headers[credential.headerName || 'Authorization'] = credential.apiKey;
+	} else if (authType === 'apiKeyHeader') {
+		const headerName = resolveApiKeyHeaderName(credential);
+		if (credential.apiKey) headers[headerName] = credential.apiKey;
 	}
 	// Additional headers are additive for every auth mode and intentionally
 	// applied last so advanced/self-hosted deployments can override defaults.
@@ -145,12 +166,18 @@ export class SpanExporter {
 		private readonly resourceAttributes: Record<string, OtlpAttrValue>,
 		private readonly onError?: (message: string) => void,
 		private readonly onBatchFailed?: (spans: OtlpSpan[], statusCode?: number) => void,
+		private readonly onDrop?: (totalDropped: number) => void,
 	) {}
 
 	add(span: OtlpSpan): void {
 		if (this.queue.length >= SpanExporter.MAX_QUEUE) {
 			this.queue.shift();
 			this.droppedSpans++;
+			try {
+				this.onDrop?.(this.droppedSpans);
+			} catch {
+				// Observability feedback is best-effort and cannot block the workflow.
+			}
 		}
 		this.queue.push(span);
 		this.flush();

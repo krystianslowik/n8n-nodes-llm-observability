@@ -20,10 +20,18 @@ const PARAM_DEFAULTS = {
  * the array traces nothing (measured live in the spike). `supplyData` keeps
  * a defensive unwrap to the first element; this file pins both shapes.
  */
-function fakeCtx({ model, httpCalls = [], executionId = 'exec-supply-data-1', supplyAsArray = true } = {}) {
+function fakeCtx({
+	model,
+	httpCalls = [],
+	executionId = 'exec-supply-data-1',
+	supplyAsArray = true,
+	typeVersion = 1,
+	parameters = {},
+} = {}) {
 	return {
 		getInputConnectionData: async () => (supplyAsArray ? [model] : model),
 		getNodeParameter: (name, _itemIndex, fallback) => {
+			if (name in parameters) return parameters[name];
 			if (name in PARAM_DEFAULTS) return PARAM_DEFAULTS[name];
 			return fallback;
 		},
@@ -44,7 +52,7 @@ function fakeCtx({ model, httpCalls = [], executionId = 'exec-supply-data-1', su
 		},
 		getWorkflow: () => ({ id: 'wf-supply', name: 'Supply Data WF', active: false }),
 		getExecutionId: () => executionId,
-		getNode: () => ({ name: 'Trace Exporter' }),
+		getNode: () => ({ name: 'AI Trace Exporter', typeVersion }),
 	};
 }
 
@@ -57,14 +65,22 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 
 	// THE regression test: response must be the unwrapped model, not the
 	// array getInputConnectionData handed back.
-	assert.equal(result.response, model, 'response must be the unwrapped model, not the supplied array');
+	assert.equal(
+		result.response,
+		model,
+		'response must be the unwrapped model, not the supplied array',
+	);
 	assert.equal(model.callbacks.length, 2, 'OTLP and n8n execution-state handlers are attached');
 	assert.deepEqual(
 		model.callbacks.map((callback) => callback.name),
 		['n8nTraceExporterOtel', 'n8nTraceExporterExecutionState'],
 		'the non-mutating UI handler stays behind OTLP capture but ahead of the supplied model callbacks',
 	);
-	assert.equal(typeof result.closeFunction, 'function', 'supplyData wires up the eviction closeFunction');
+	assert.equal(
+		typeof result.closeFunction,
+		'function',
+		'supplyData wires up the eviction closeFunction',
+	);
 
 	const handler = model.callbacks[0];
 	handler.handleChatModelStart(
@@ -72,7 +88,10 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 		[[{ content: 'hi' }]],
 		'run-1',
 	);
-	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } }, 'run-1');
+	handler.handleLLMEnd(
+		{ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } },
+		'run-1',
+	);
 	await flushMicrotasks();
 	await flushMicrotasks();
 
@@ -112,7 +131,11 @@ test('reusing a model replaces the stale UI handler and keeps OTLP first', async
 	assert.equal(model.callbacks.length, 2, 'no stale callback accumulates');
 	assert.equal(model.callbacks[0].name, 'n8nTraceExporterOtel');
 	assert.equal(model.callbacks[1].name, 'n8nTraceExporterExecutionState');
-	assert.notEqual(model.callbacks[1], firstUiHandler, 'the current step context replaces the old one');
+	assert.notEqual(
+		model.callbacks[1],
+		firstUiHandler,
+		'the current step context replaces the old one',
+	);
 });
 
 test('supplyData execution-state handler receives the OTLP trace IDs after the model starts', async () => {
@@ -147,9 +170,127 @@ test('supplyData execution-state handler receives the OTLP trace IDs after the m
 	assert.equal(outputJson.rootSpanId, inputJson.rootSpanId);
 });
 
-test('description declares a single ai_languageModel input capped at one connection', () => {
+test('description declares one required model input and one traced model output', () => {
 	const { description } = new TraceExporter();
-	assert.deepEqual(description.inputs, [{ type: 'ai_languageModel', maxConnections: 1 }]);
+	assert.deepEqual(description.inputs, [
+		{
+			type: 'ai_languageModel',
+			displayName: 'Chat Model',
+			required: true,
+			maxConnections: 1,
+		},
+	]);
+	assert.deepEqual(description.outputs, [
+		{
+			type: 'ai_languageModel',
+			displayName: 'Traced Chat Model',
+		},
+	]);
+	assert.equal(description.requiredInputs, 1);
+});
+
+test('description exposes observability search aliases without claiming tool support', () => {
+	const { description } = new TraceExporter();
+	assert.deepEqual(description.version, [1, 1.1]);
+	assert.equal(description.usableAsTool, undefined);
+	assert.equal(
+		description.properties.find((property) => property.name === 'metadata').validateType,
+		'object',
+	);
+	for (const alias of ['LLM observability', 'OpenTelemetry', 'OTLP', 'Opik', 'Langfuse']) {
+		assert.ok(description.codex.alias.includes(alias), `missing picker alias: ${alias}`);
+	}
+});
+
+test('node version 1.1 reads visible capture and grouped advanced settings', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-v1-1',
+		typeVersion: 1.1,
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: false,
+			privacyOptions: { maxPayloadSizeKb: 8, redactionPatterns: [] },
+			traceAttributes: {
+				environment: 'staging',
+				release: '1.1.0',
+				serviceName: 'support-agent',
+				tags: ['ux-test'],
+			},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'visible prompt' }]],
+		'run-v1-1',
+	);
+	handler.handleLLMEnd({}, 'run-v1-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const resourceSpans = httpCalls.flatMap((call) => call.body.resourceSpans);
+	assert.ok(resourceSpans.length > 0);
+	const resourceAttributes = Object.fromEntries(
+		resourceSpans[0].resource.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+	assert.equal(resourceAttributes['service.name'], 'support-agent');
+	assert.equal(resourceAttributes['service.version'], '1.1.0');
+	const spans = resourceSpans.flatMap((group) => group.scopeSpans.flatMap((scope) => scope.spans));
+	const llmSpan = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const spanAttributes = Object.fromEntries(
+		llmSpan.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+	assert.match(String(spanAttributes['gen_ai.input.messages']), /visible prompt/);
+	assert.equal(spanAttributes['deployment.environment.name'], 'staging');
+});
+
+test('node version 1 keeps legacy nested capture settings', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-v1-legacy',
+		typeVersion: 1,
+		parameters: {
+			options: { capturePrompts: true, captureToolIO: false },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'legacy visible prompt' }]],
+		'run-v1-legacy',
+	);
+	handler.handleLLMEnd({}, 'run-v1-legacy');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	const llmSpan = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const attributes = Object.fromEntries(
+		llmSpan.attributes.map(({ key, value }) => [key, value.stringValue]),
+	);
+	assert.match(String(attributes['gen_ai.input.messages']), /legacy visible prompt/);
 });
 
 test('export POSTs carry a bounded timeout so a hung backend cannot pin the in-flight slot', async () => {
@@ -164,7 +305,10 @@ test('export POSTs carry a bounded timeout so a hung backend cannot pin the in-f
 		[[{ content: 'hi' }]],
 		'run-1',
 	);
-	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } }, 'run-1');
+	handler.handleLLMEnd(
+		{ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } },
+		'run-1',
+	);
 	await flushMicrotasks();
 	await flushMicrotasks();
 

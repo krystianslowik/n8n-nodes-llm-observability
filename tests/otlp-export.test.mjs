@@ -19,7 +19,10 @@ const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
 test('buildExportTarget appends /v1/traces exactly once', () => {
 	assert.equal(
-		buildExportTarget({ endpointUrl: 'http://localhost:5173/api/v1/private/otel', authType: 'customHeaders' }).url,
+		buildExportTarget({
+			endpointUrl: 'http://localhost:5173/api/v1/private/otel',
+			authType: 'customHeaders',
+		}).url,
 		'http://localhost:5173/api/v1/private/otel/v1/traces',
 	);
 	assert.equal(
@@ -64,11 +67,11 @@ test('buildExportTarget parses custom headers from a JSON string, tolerates garb
 	assert.equal(bad.headers['Content-Type'], 'application/json');
 });
 
-test('vendor presets add their required headers and compose with primary auth plus overrides', () => {
+test('backend defaults add required routing and auth without overriding explicit auth', () => {
 	const langfuse = buildExportTarget({
 		endpointUrl: 'http://x',
 		preset: 'langfuse',
-		authType: 'basicAuth',
+		authType: 'backendDefault',
 		username: 'pk',
 		password: 'sk',
 	});
@@ -78,13 +81,15 @@ test('vendor presets add their required headers and compose with primary auth pl
 	const opik = buildExportTarget({
 		endpointUrl: 'http://x',
 		preset: 'opik',
-		authType: 'apiKeyHeader',
+		authType: 'backendDefault',
 		apiKey: 'opik-key',
+		headerName: 'wrong-header',
 		opikWorkspace: 'workspace-a',
 		opikProjectName: 'project-a',
 		customHeaders: { projectName: 'override-project', ignored: { nested: true } },
 	});
 	assert.equal(opik.headers.Authorization, 'opik-key');
+	assert.equal(opik.headers['wrong-header'], undefined);
 	assert.equal(opik.headers['Comet-Workspace'], 'workspace-a');
 	assert.equal(opik.headers.projectName, 'override-project');
 	assert.equal(opik.headers.ignored, undefined, 'non-primitive headers are ignored');
@@ -92,14 +97,51 @@ test('vendor presets add their required headers and compose with primary auth pl
 	const datadog = buildExportTarget({
 		endpointUrl: 'http://x',
 		preset: 'datadog',
-		authType: 'apiKeyHeader',
+		authType: 'backendDefault',
 		apiKey: 'dd-key',
-		headerName: 'dd-api-key',
+		headerName: 'x-collector-key',
 		datadogMlApp: 'support-agent',
 	});
-	assert.equal(datadog.headers['dd-api-key'], 'dd-key');
-	assert.equal(datadog.headers['dd-otlp-source'], 'llmobs');
-	assert.equal(datadog.headers['dd-ml-app'], 'support-agent');
+	assert.equal(datadog.headers.Authorization, undefined);
+	assert.equal(datadog.headers['x-collector-key'], undefined);
+	assert.equal(datadog.headers['dd-api-key'], undefined);
+	assert.equal(datadog.headers['dd-otlp-source'], undefined);
+	assert.equal(datadog.headers['dd-ml-app'], undefined);
+
+	const explicitOpikProxy = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'opik',
+		authType: 'basicAuth',
+		username: 'proxy-user',
+		password: 'proxy-secret',
+		opikWorkspace: 'workspace-b',
+	});
+	assert.equal(
+		explicitOpikProxy.headers.Authorization,
+		`Basic ${Buffer.from('proxy-user:proxy-secret').toString('base64')}`,
+	);
+	assert.equal(explicitOpikProxy.headers['Comet-Workspace'], 'workspace-b');
+});
+
+test('missing authType keeps legacy defaults for stored credentials', () => {
+	const legacyGeneric = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'custom',
+		username: 'legacy-user',
+		password: 'legacy-secret',
+	});
+	assert.equal(
+		legacyGeneric.headers.Authorization,
+		`Basic ${Buffer.from('legacy-user:legacy-secret').toString('base64')}`,
+	);
+
+	const legacyOpik = buildExportTarget({
+		endpointUrl: 'http://x',
+		preset: 'opik',
+		apiKey: 'legacy-opik-key',
+		opikWorkspace: 'workspace',
+	});
+	assert.equal(legacyOpik.headers.Authorization, 'legacy-opik-key');
 });
 
 test('SpanExporter posts an OTLP body per add and counts successes', async () => {
@@ -193,7 +235,11 @@ test('SpanExporter keeps draining after a failed batch, even with multiple queue
 	const drainedNames = calls
 		.slice(1)
 		.flatMap((body) => body.resourceSpans[0].scopeSpans[0].spans.map((s) => s.name));
-	assert.deepEqual(drainedNames, ['s1', 's2'], 'queued spans still get posted after a failed batch');
+	assert.deepEqual(
+		drainedNames,
+		['s1', 's2'],
+		'queued spans still get posted after a failed batch',
+	);
 });
 
 test('SpanExporter never rejects even when onError itself throws; export still counted and queue still drains', async () => {
@@ -258,12 +304,24 @@ test('onBatchFailed receives the failed spans plus the HTTP status extracted fro
 
 test('SpanExporter bounds the queue and counts drops when posts never drain', async () => {
 	let resolvePost;
+	const drops = [];
 	const gate = new Promise((resolve) => {
 		resolvePost = resolve;
 	});
-	const exporter = new SpanExporter({ url: 'http://x', headers: {} }, () => gate, {});
+	const exporter = new SpanExporter(
+		{ url: 'http://x', headers: {} },
+		() => gate,
+		{},
+		undefined,
+		undefined,
+		(totalDropped) => drops.push(totalDropped),
+	);
 	for (let i = 0; i < 250; i++) exporter.add(span(`s${i}`));
 	assert.ok(exporter.droppedSpans > 0, 'overflow must drop and count');
+	assert.deepEqual(
+		drops,
+		Array.from({ length: exporter.droppedSpans }, (_, index) => index + 1),
+	);
 	resolvePost();
 	await flushMicrotasks();
 });
