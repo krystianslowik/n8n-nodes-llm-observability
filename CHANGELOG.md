@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.6 - 2026-07-13
+
+### Fixed
+
+- Make node version 2 the current version so PostgreSQL-backed n8n instances
+  can persist the community-node record during installation. Version 1.1
+  remains available for workflows created with 0.1.5.
+
 ## 0.1.5 - 2026-07-13
 
 ### Added
