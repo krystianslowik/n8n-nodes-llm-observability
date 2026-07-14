@@ -7,6 +7,10 @@ import {
 } from 'n8n-workflow';
 
 import type { OtlpCredential } from './shared/otlpExport';
+import {
+	correlateNativeNodeSpan,
+	executionObservabilityContextFrom,
+} from './shared/executionContext';
 import { createExecutionStateHandler } from './shared/n8nExecutionState';
 import type { ExecutionStateHandler, TraceExecutionContext } from './shared/n8nExecutionState';
 import {
@@ -70,8 +74,9 @@ export class TraceExporter implements INodeType {
 		group: ['transform'],
 		// n8n stores the last light-version entry in the integer
 		// InstalledNodes.latestVersion database column for community packages.
-		// Keep 1.1 for workflows created with 0.1.5, but use integer 2 as current.
-		version: [1, 1.1, 2],
+		// Keep historical versions loadable, but use an integer for the current
+		// version because n8n persists it in InstalledNodes.latestVersion.
+		version: [1, 1.1, 2, 3],
 		description:
 			'Export AI Agent model and tool traces to Opik, Langfuse, or an OpenTelemetry backend',
 		subtitle: '={{$parameter["traceName"]}}',
@@ -316,6 +321,21 @@ export class TraceExporter implements INodeType {
 						description:
 							'JavaScript regular expressions applied before export; matches become [REDACTED]',
 					},
+					{
+						displayName: 'Structured Redaction Paths',
+						name: 'redactionFieldPaths',
+						type: 'string',
+						typeOptions: { multipleValues: true },
+						default: [],
+						placeholder: 'e.g. $.user.email or $..password',
+						description:
+							'Field paths removed from captured JSON before export. Supports $.field, bracket keys, array wildcards, and recursive field names.',
+						displayOptions: {
+							show: {
+								'@version': [{ _cnd: { gte: 3 } }],
+							},
+						},
+					},
 				],
 			},
 			{
@@ -331,12 +351,64 @@ export class TraceExporter implements INodeType {
 				},
 				options: [
 					{
+						displayName: 'Agent Name',
+						name: 'agentName',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. support-router',
+						description: 'Stable agent name used to compare traces across workflows',
+						displayOptions: {
+							show: {
+								'@version': [{ _cnd: { gte: 3 } }],
+							},
+						},
+					},
+					{
+						displayName: 'Agent Version',
+						name: 'agentVersion',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. 2026-07-14',
+						description: 'Agent configuration or release version',
+						displayOptions: {
+							show: {
+								'@version': [{ _cnd: { gte: 3 } }],
+							},
+						},
+					},
+					{
 						displayName: 'Environment',
 						name: 'environment',
 						type: 'string',
 						default: '',
 						placeholder: 'e.g. production',
 						description: 'Deployment environment used to filter and compare traces',
+					},
+					{
+						displayName: 'Prompt Name',
+						name: 'promptName',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. triage-system-prompt',
+						description: 'Stable prompt identifier attached to the trace',
+						displayOptions: {
+							show: {
+								'@version': [{ _cnd: { gte: 3 } }],
+							},
+						},
+					},
+					{
+						displayName: 'Prompt Version',
+						name: 'promptVersion',
+						type: 'string',
+						default: '',
+						placeholder: 'e.g. 7',
+						description: 'Prompt revision attached to the trace',
+						displayOptions: {
+							show: {
+								'@version': [{ _cnd: { gte: 3 } }],
+							},
+						},
 					},
 					{
 						displayName: 'Release',
@@ -450,21 +522,31 @@ export class TraceExporter implements INodeType {
 		let maxPayloadSizeKb = legacyOptions.maxPayloadSizeKb ?? 32;
 		let samplingRatePercent = legacyOptions.samplingRatePercent ?? 100;
 		let redactionPatterns = legacyOptions.redactionPatterns ?? [];
+		let redactionFieldPaths: string[] = [];
 		let environment = legacyOptions.environment ?? '';
 		let tags = legacyOptions.tags ?? [];
 		let release = legacyOptions.release ?? '';
 		let serviceName = legacyOptions.serviceName ?? 'n8n';
+		let agentName = '';
+		let agentVersion = '';
+		let promptName = '';
+		let promptVersion = '';
 
 		if (nodeVersion >= 1.1) {
 			const privacyOptions = this.getNodeParameter('privacyOptions', itemIndex, {}) as {
 				maxPayloadSizeKb?: number;
 				redactionPatterns?: string[];
+				redactionFieldPaths?: string[];
 			};
 			const traceAttributes = this.getNodeParameter('traceAttributes', itemIndex, {}) as {
 				environment?: string;
 				tags?: string[];
 				release?: string;
 				serviceName?: string;
+				agentName?: string;
+				agentVersion?: string;
+				promptName?: string;
+				promptVersion?: string;
 			};
 			const exportOptions = this.getNodeParameter('exportOptions', itemIndex, {}) as {
 				samplingRatePercent?: number;
@@ -474,11 +556,22 @@ export class TraceExporter implements INodeType {
 			captureToolIO = this.getNodeParameter('captureToolIO', itemIndex, false) as boolean;
 			maxPayloadSizeKb = privacyOptions.maxPayloadSizeKb ?? 32;
 			redactionPatterns = privacyOptions.redactionPatterns ?? [];
+			redactionFieldPaths = privacyOptions.redactionFieldPaths ?? [];
 			environment = traceAttributes.environment ?? '';
 			tags = traceAttributes.tags ?? [];
 			release = traceAttributes.release ?? '';
 			serviceName = traceAttributes.serviceName ?? 'n8n';
+			agentName = traceAttributes.agentName ?? '';
+			agentVersion = traceAttributes.agentVersion ?? '';
+			promptName = traceAttributes.promptName ?? '';
+			promptVersion = traceAttributes.promptVersion ?? '';
 			samplingRatePercent = exportOptions.samplingRatePercent ?? 100;
+		}
+
+		const executionContext = executionObservabilityContextFrom(this);
+		if (executionContext.contentCaptureBlocked) {
+			capturePrompts = false;
+			captureToolIO = false;
 		}
 
 		const traceExporterOptions: TraceExporterOptions = {
@@ -491,10 +584,18 @@ export class TraceExporter implements INodeType {
 			maxPayloadSizeKb,
 			samplingRatePercent,
 			redactionPatterns,
+			redactionFieldPaths,
 			environment,
 			tags,
 			release,
 			serviceName,
+			agentName,
+			agentVersion,
+			promptName,
+			promptVersion,
+			executionMode: executionContext.mode,
+			parentExecutionId: executionContext.parentExecutionId,
+			contentCaptureBlocked: executionContext.contentCaptureBlocked,
 			itemIndex,
 		};
 
@@ -510,6 +611,13 @@ export class TraceExporter implements INodeType {
 		} = wrapModelWithTracing(this, model, traceExporterOptions, credential);
 		traceContextBox.current = getTraceContext;
 
-		return closeFunction ? { response: wrappedModel, closeFunction } : { response: wrappedModel };
+		if (!closeFunction) return { response: wrappedModel };
+		return {
+			response: wrappedModel,
+			closeFunction: async () => {
+				correlateNativeNodeSpan(this, getTraceContext?.());
+				await closeFunction();
+			},
+		};
 	}
 }

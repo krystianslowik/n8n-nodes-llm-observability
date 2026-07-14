@@ -14,45 +14,88 @@ export interface SerializedComponent {
 	kwargs?: Record<string, unknown>;
 }
 
-export interface LlmResultLike {
-	generations?: Array<
-		Array<{
-			text?: string;
-			generationInfo?: { finish_reason?: unknown; stop_reason?: unknown };
-			message?: {
-				id?: unknown;
-				usage_metadata?: { input_tokens?: number; output_tokens?: number };
-				response_metadata?: {
-					model?: unknown;
-					model_name?: unknown;
-					finish_reason?: unknown;
-					stop_reason?: unknown;
-				};
-				/** LangChain-normalized tool calls the model decided to make (provider-agnostic). */
-				tool_calls?: Array<{ name?: string; args?: unknown; id?: string }>;
-				/**
-				 * Raw provider payload LangChain passes through unnormalized. OpenAI
-				 * puts function-style tool calls here (`arguments` is a JSON string)
-				 * when the normalized `tool_calls` above is absent.
-				 */
-				additional_kwargs?: {
-					tool_calls?: Array<{
-						id?: string;
-						type?: string;
-						function?: { name?: string; arguments?: string };
-					}>;
-				};
-			};
-		}>
-	>;
-	llmOutput?: {
+export interface TokenDetailsLike {
+	cache_read?: number;
+	cache_creation?: number;
+	cached_tokens?: number;
+	reasoning?: number;
+	reasoning_tokens?: number;
+}
+
+export interface UsageLike {
+	input_tokens?: number;
+	output_tokens?: number;
+	prompt_tokens?: number;
+	completion_tokens?: number;
+	promptTokenCount?: number;
+	candidatesTokenCount?: number;
+	cache_read_input_tokens?: number;
+	cache_creation_input_tokens?: number;
+	cachedContentTokenCount?: number;
+	thoughtsTokenCount?: number;
+	input_token_details?: TokenDetailsLike;
+	input_tokens_details?: TokenDetailsLike;
+	output_token_details?: TokenDetailsLike;
+	output_tokens_details?: TokenDetailsLike;
+}
+
+export interface TokenUsageLike {
+	promptTokens?: number;
+	completionTokens?: number;
+	cacheReadInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	reasoningOutputTokens?: number;
+	promptTokensDetails?: { cachedTokens?: number; cacheRead?: number };
+	completionTokensDetails?: { reasoningTokens?: number };
+}
+
+export interface MessageLike {
+	id?: unknown;
+	content?: unknown;
+	name?: unknown;
+	usage_metadata?: UsageLike;
+	response_metadata?: {
 		id?: unknown;
+		response_id?: unknown;
 		model?: unknown;
 		model_name?: unknown;
-		tokenUsage?: { promptTokens?: number; completionTokens?: number };
-		usage?: { input_tokens?: number; output_tokens?: number };
+		finish_reason?: unknown;
+		stop_reason?: unknown;
+		usage?: UsageLike;
+		tokenUsage?: TokenUsageLike;
+	};
+	/** LangChain-normalized tool calls the model decided to make (provider-agnostic). */
+	tool_calls?: Array<{ name?: unknown; args?: unknown; id?: unknown }>;
+	/**
+	 * Raw provider payload LangChain passes through unnormalized. OpenAI puts
+	 * function-style tool calls here when the normalized shape is absent.
+	 */
+	additional_kwargs?: {
+		tool_calls?: Array<{
+			id?: unknown;
+			type?: unknown;
+			function?: { name?: unknown; arguments?: unknown };
+		}>;
+	};
+}
+
+export interface GenerationLike {
+	text?: unknown;
+	generationInfo?: { finish_reason?: unknown; stop_reason?: unknown };
+	message?: MessageLike;
+}
+
+export interface LlmResultLike {
+	generations?: GenerationLike[][];
+	llmOutput?: {
+		id?: unknown;
+		response_id?: unknown;
+		model?: unknown;
+		model_name?: unknown;
+		tokenUsage?: TokenUsageLike;
+		usage?: UsageLike;
 		/** @langchain/openai Responses-API path; backend-reported there despite the name. */
-		estimatedTokenUsage?: { promptTokens?: number; completionTokens?: number };
+		estimatedTokenUsage?: TokenUsageLike;
 	};
 }
 
@@ -85,6 +128,17 @@ export interface TracingHooks {
 	): void;
 	handleLLMEnd?(output: LlmResultLike, runId: string, parentRunId?: string): void;
 	handleLLMError?(error: unknown, runId: string, parentRunId?: string): void;
+	/**
+	 * LangChain streaming callback. Token content is intentionally ignored by
+	 * the tracker; the first invocation is enough to measure time to first
+	 * chunk without retaining a duplicate response stream.
+	 */
+	handleLLMNewToken?(
+		token: string,
+		indices: { prompt?: number; completion?: number },
+		runId: string,
+		parentRunId?: string,
+	): void;
 	handleChainStart?(
 		chain: SerializedComponent,
 		inputs: Record<string, unknown>,

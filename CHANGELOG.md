@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.0 - 2026-07-14
+
+### Added
+
+- Add count- and byte-bounded OTLP batching, a process-wide request limiter,
+  selective network/HTTP retries with `Retry-After`, partial-success parsing,
+  and exporter delivery diagnostics.
+- Add deterministic root-trace sampling; root-level model, tool, error, and
+  token totals; cache-read, cache-creation, and reasoning-token usage; and
+  streaming time-to-first-chunk measurement when callbacks provide it.
+- Add version 3 agent/prompt identity fields and structured JSON redaction for
+  object members, quoted keys, array wildcards, and recursive member matches.
+- Add best-effort correlation IDs to n8n native tracing metadata when the
+  runtime exposes that capability.
+- Add CI build and contract-test coverage for `n8n-workflow` 2.27, 2.28, and
+  2.29 on Node.js 22.22.
+
+### Changed
+
+- Isolate traces by execution, Trace Exporter node, parent run index, item, and
+  parallel fan-out slot while preserving one trace across steppable-agent
+  model/tool steps.
+- Bound callback state, tool/message serialization, regex work, and redaction
+  input so malformed provider data cannot grow memory or block the event loop.
+- Treat n8n execution-content redaction as a hard ceiling over the node's
+  prompt/response and tool-I/O capture settings.
+- Normalize provider/model and multi-candidate response data before emitting
+  GenAI attributes.
+
+### Fixed
+
+- Finalize terminal answers, errors, cancellation, and abandoned tool tails
+  without leaking stale callbacks into a reused model.
+- Mark reconstructed tool timing explicitly as inferred and retain pending
+  tools until a result is observed or the execution is finalized.
+- Give execution close a 250 ms best-effort exporter flush and report timeout,
+  partial acceptance, final failure, and queue overflow as warnings without
+  failing the workflow.
+- Isolate synthetic roots into singleton OTLP requests so an Opik duplicate-root
+  conflict cannot reject child spans queued beside it.
+- Retry a terminal root after the in-flight flush reports failure, and run the
+  test/package gates in the tag-triggered publish workflow before npm release.
+- Normalize exporter warnings to local status/category text so backend error
+  bodies cannot echo captured content into n8n logs or diagnostics.
+- Preserve structured JSON answers and emit schema-complete tool-response and
+  output-message fields.
+
 ## 0.1.7 - 2026-07-14
 
 ### Added

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { compileRedactor } from '../dist/nodes/TraceExporter/shared/redaction.js';
 import { RunTreeTracker } from '../dist/nodes/TraceExporter/shared/runTreeTracker.js';
 
 const baseConfig = {
@@ -196,6 +197,116 @@ test('capturePrompts=true captures truncated input and structured output message
 	const attrs = attrMap(spans[0]);
 	assert.ok(String(attrs['gen_ai.input.messages']).endsWith('…[truncated]'));
 	assert.ok(String(attrs['gen_ai.output.messages']).includes('four'));
+	assert.equal(JSON.parse(attrs['gen_ai.output.messages'])[0].finish_reason, 'unknown');
+});
+
+test('structured terminal answers populate output messages and the synthetic root', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, singleTrace: true, capturePrompts: true },
+		(span) => spans.push(span),
+	);
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[{ content: 'Return JSON' }]], 'run-1');
+	handler.handleLLMEnd(
+		{ generations: [[{ text: { answer: 42 }, generationInfo: { finish_reason: 'stop' } }]] },
+		'run-1',
+	);
+
+	const llm = spans.find((span) => span.name.startsWith('chat '));
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.deepEqual(JSON.parse(attrMap(llm)['gen_ai.output.messages']), [
+		{
+			role: 'assistant',
+			parts: [{ type: 'json', content: { answer: 42 } }],
+			finish_reason: 'stop',
+		},
+	]);
+	assert.deepEqual(JSON.parse(attrMap(root).output), { answer: 42 });
+});
+
+test('structured field paths redact values before OTel message envelopes are built', () => {
+	const spans = [];
+	const redactor = compileRedactor([], {
+		fieldPaths: ['$.user.email', '$..password'],
+	});
+	const tracker = new RunTreeTracker(
+		{
+			...baseConfig,
+			singleTrace: true,
+			capturePrompts: true,
+			captureToolIO: true,
+			redact: redactor.redact,
+		},
+		(span) => spans.push(span),
+	);
+	const handler = tracker.createHandler();
+
+	handler.handleChatModelStart(
+		OPENAI_SERIALIZED,
+		[
+			[
+				{
+					content: { user: { email: 'prompt@example.com' }, password: 'prompt-password' },
+					_getType: () => 'human',
+				},
+				{
+					content: { user: { email: 'tool-result@example.com' } },
+					tool_call_id: 'call-1',
+					_getType: () => 'tool',
+				},
+				{
+					content: '',
+					tool_calls: [
+						{
+							id: 'call-2',
+							name: 'lookup',
+							args: { user: { email: 'tool-argument@example.com' } },
+						},
+					],
+					_getType: () => 'ai',
+				},
+			],
+		],
+		'run-1',
+	);
+	handler.handleLLMEnd(
+		{
+			generations: [
+				[
+					{
+						text: {
+							user: { email: 'completion@example.com' },
+							password: 'completion-password',
+						},
+						generationInfo: { finish_reason: 'stop' },
+					},
+				],
+			],
+		},
+		'run-1',
+	);
+	handler.handleToolStart(
+		{ id: ['lookup'] },
+		{ user: { email: 'direct-tool-input@example.com' } },
+		'tool-1',
+	);
+	handler.handleToolEnd({ user: { email: 'direct-tool-output@example.com' } }, 'tool-1');
+
+	const exported = JSON.stringify(spans);
+	for (const secret of [
+		'prompt@example.com',
+		'prompt-password',
+		'tool-result@example.com',
+		'tool-argument@example.com',
+		'completion@example.com',
+		'completion-password',
+		'direct-tool-input@example.com',
+		'direct-tool-output@example.com',
+	]) {
+		assert.doesNotMatch(exported, new RegExp(secret.replace('.', '\\.')));
+	}
+	assert.match(exported, /\[REDACTED\]/);
 });
 
 test('LLM error closes the span with ERROR status', () => {
@@ -208,6 +319,7 @@ test('LLM error closes the span with ERROR status', () => {
 	assert.equal(spans[0].status.code, 2);
 	assert.match(spans[0].status.message, /boom/);
 	assert.equal(spans[0].events[0].name, 'exception');
+	assert.equal(attrMap(spans[0])['error.type'], 'Error');
 	const exceptionAttrs = attrMap({ attributes: spans[0].events[0].attributes });
 	assert.equal(exceptionAttrs['exception.type'], 'Error');
 	assert.match(exceptionAttrs['exception.message'], /boom/);
@@ -332,6 +444,83 @@ test('chat messages serialize to the OTel role/parts schema, not [object Object]
 		'OTel message parts present',
 	);
 	assert.ok(!String(attrs['gen_ai.input.messages']).includes('[object Object]'));
+});
+
+test('chat message traversal is capped before mapping nested hostile arrays', () => {
+	const messageBatch = [];
+	messageBatch.length = 1_000_000;
+	messageBatch[0] = { content: 'bounded prompt', _getType: () => 'human' };
+	Object.defineProperty(messageBatch, 100, {
+		get() {
+			throw new Error('serializer read beyond the per-batch cap');
+		},
+	});
+	const messages = [];
+	messages.length = 1_000_000;
+	messages[0] = messageBatch;
+	Object.defineProperty(messages, 100, {
+		get() {
+			throw new Error('serializer read beyond the batch cap');
+		},
+	});
+
+	const spans = [];
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, singleTrace: true, capturePrompts: true },
+		(span) => spans.push(span),
+	);
+	const handler = tracker.createHandler();
+	const startedAt = Date.now();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, messages, 'run-1');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	const llm = spans.find((span) => span.name.startsWith('chat '));
+	assert.ok(String(attrMap(llm)['gen_ai.input.messages']).includes('bounded prompt'));
+	assert.equal(tracker.handlerErrors, 0);
+	assert.ok(Date.now() - startedAt < 250, 'runtime is independent of hostile array length');
+});
+
+test('tool input messages use the OTel tool_call_response response field', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker({ ...baseConfig, capturePrompts: true }, (span) =>
+		spans.push(span),
+	);
+	const toolMessage = {
+		content: { value: 4 },
+		tool_call_id: 'call-1',
+		_getType: () => 'tool',
+	};
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[toolMessage]], 'run-1');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	const messages = JSON.parse(attrMap(spans[0])['gen_ai.input.messages']);
+	assert.deepEqual(messages[0].parts[0], {
+		type: 'tool_call_response',
+		id: 'call-1',
+		response: { value: 4 },
+	});
+	assert.equal('result' in messages[0].parts[0], false);
+});
+
+test('synthetic root preserves configured agent name separately from the trace span name', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker(
+		{
+			...baseConfig,
+			singleTrace: true,
+			rootSpanName: 'Support trace',
+			baseAttributes: {
+				...baseConfig.baseAttributes,
+				'gen_ai.agent.name': 'Support Agent',
+			},
+		},
+		(span) => spans.push(span),
+	);
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.equal(root.name, 'Support trace');
+	assert.equal(attrMap(root)['gen_ai.agent.name'], 'Support Agent');
 });
 
 test('model-decided tool calls surface in gen_ai.output.messages when captureToolIO is on', () => {
@@ -505,12 +694,179 @@ test('tool results echoed into the next model call synthesize tool spans under t
 	assert.equal(attrs2['gen_ai.tool.call.id'], 'tc2');
 	assert.equal(attrs2['gen_ai.tool.call.result'], 'found x');
 	const rootAttrs = attrMap(root);
+	assert.equal(rootAttrs['n8n.gen_ai.llm.call.count'], '2');
+	assert.equal(rootAttrs['n8n.gen_ai.tool.call.count'], '2');
+	assert.equal(rootAttrs['n8n.gen_ai.error.count'], '0');
+	assert.equal(rootAttrs['gen_ai.usage.input_tokens'], '11');
+	assert.equal(rootAttrs['gen_ai.usage.output_tokens'], '2');
 	assert.ok(
 		String(rootAttrs.input).includes('What is 37*91?'),
 		'root carries the first model input',
 	);
 	assert.equal(rootAttrs.output, 'four', 'root carries the final model output');
 	assert.equal(root.endTimeUnixNano, '4000000000', 'root closes with the final model answer');
+});
+
+test('stream callbacks set request.stream and time to first chunk without retaining tokens', () => {
+	const spans = [];
+	const clock = { at: 1000 };
+	const tracker = new RunTreeTracker({ ...baseConfig, now: () => clock.at }, (span) =>
+		spans.push(span),
+	);
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	clock.at = 1250;
+	for (let index = 0; index < 10000; index++) {
+		handler.handleLLMNewToken('sensitive chunk', { prompt: 0, completion: index }, 'run-1');
+	}
+	clock.at = 1500;
+	handler.handleLLMEnd(OPENAI_RESULT, 'run-1');
+	const attrs = attrMap(spans[0]);
+	assert.equal(attrs['gen_ai.request.stream'], true);
+	assert.equal(attrs['gen_ai.response.time_to_first_chunk'], 0.25);
+	assert.ok(!JSON.stringify(spans[0]).includes('sensitive chunk'));
+	assert.equal(
+		tracker.events.filter((event) => event.hook === 'handleLLMNewToken').length,
+		1,
+		'streaming retains one first-chunk diagnostic, not one event per token',
+	);
+});
+
+test('callback history and open-run state are bounded with debug-safe ids', () => {
+	const tracker = new RunTreeTracker(baseConfig, () => {});
+	const handler = tracker.createHandler();
+	for (let index = 0; index < 600; index++) {
+		handler.handleChainStart({ id: ['Chain'] }, {}, `${'r'.repeat(300)}-${index}`);
+	}
+	assert.equal(tracker.events.length, 256);
+	assert.ok(tracker.events.every((event) => (event.runId?.length ?? 0) <= 160));
+	assert.equal(tracker.droppedRuns, 88, 'open-run map retains at most 512 entries');
+});
+
+test('unsampled traces never serialize or redact opt-in prompt/tool/error content', () => {
+	let redactions = 0;
+	let serializations = 0;
+	const tracker = new RunTreeTracker(
+		{
+			...baseConfig,
+			singleTrace: true,
+			samplingRatePercent: 0,
+			capturePrompts: true,
+			captureToolIO: true,
+			redact: (text) => {
+				redactions++;
+				return text;
+			},
+		},
+		() => {},
+	);
+	const hostile = {
+		toJSON() {
+			serializations++;
+			return { secret: true };
+		},
+	};
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[{ content: hostile }]], 'run-1');
+	const hostileOutput = {};
+	Object.defineProperty(hostileOutput, 'generations', {
+		get() {
+			serializations++;
+			throw new Error('must not inspect unsampled output');
+		},
+	});
+	handler.handleLLMEnd(hostileOutput, 'run-1');
+	handler.handleToolStart({ id: ['Tool'] }, hostile, 'tool-1');
+	const hostileError = {
+		get name() {
+			serializations++;
+			throw new Error('must not inspect unsampled error');
+		},
+		toString() {
+			serializations++;
+			throw new Error('must not stringify unsampled error');
+		},
+	};
+	handler.handleToolError(hostileError, 'tool-1');
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-2');
+	handler.handleLLMError(hostileError, 'run-2');
+	assert.equal(redactions, 0);
+	assert.equal(serializations, 0);
+});
+
+test('cancellation closes an active LLM before emitting an error root with final totals', () => {
+	const spans = [];
+	const clock = { at: 1000 };
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, singleTrace: true, now: () => clock.at },
+		(span) => spans.push(span),
+	);
+	tracker.createHandler().handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	clock.at = 1500;
+	tracker.finalizeCancelled(new Error('stopped by user'), clock.at);
+	assert.equal(spans.length, 2, 'active LLM then root');
+	const llm = spans.find((span) => span.name.startsWith('chat '));
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.equal(llm.status.code, 2);
+	assert.equal(attrMap(llm)['error.type'], 'CancelledError');
+	assert.equal(root.status.code, 2);
+	const rootAttrs = attrMap(root);
+	assert.equal(rootAttrs['n8n.gen_ai.llm.call.count'], '1');
+	assert.equal(rootAttrs['n8n.gen_ai.error.count'], '1');
+	assert.equal(root.endTimeUnixNano, '1500000000');
+	tracker.finalizeCancelled(undefined, clock.at);
+	assert.equal(spans.length, 2, 'cancellation finalization is idempotent');
+});
+
+test('cancellation flushes a pending inferred tool as an error before the root summary', () => {
+	const spans = [];
+	const clock = { at: 1000 };
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, singleTrace: true, captureToolIO: true, now: () => clock.at },
+		(span) => spans.push(span),
+	);
+	const handler = tracker.createHandler();
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[humanMsg]], 'run-1');
+	clock.at = 2000;
+	handler.handleLLMEnd(
+		llmEndWithToolCalls([{ id: 'tc1', name: 'calculator', args: { input: '1+1' } }]),
+		'run-1',
+	);
+	clock.at = 5000;
+	tracker.finalizeCancelled(new Error('cancelled'), clock.at);
+	const tool = spans.find((span) => span.name === 'execute_tool calculator');
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.equal(tool.status.code, 2);
+	assert.equal(attrMap(tool)['n8n.span.timing_source'], 'inferred');
+	assert.equal(attrMap(tool)['n8n.tool.result_observed'], false);
+	const rootAttrs = attrMap(root);
+	assert.equal(rootAttrs['n8n.gen_ai.llm.call.count'], '1');
+	assert.equal(rootAttrs['n8n.gen_ai.tool.call.count'], '1');
+	assert.equal(rootAttrs['n8n.gen_ai.error.count'], '1');
+	assert.equal(spans.at(-1), root, 'root is emitted after cancellation children');
+});
+
+test('structured tool content is bounded by depth and item count before JSON.stringify', () => {
+	const spans = [];
+	const tracker = new RunTreeTracker(
+		{ ...baseConfig, captureToolIO: true, maxPayloadBytes: 1024 * 1024 },
+		(span) => spans.push(span),
+	);
+	const deep = { value: 'leaf' };
+	let cursor = deep;
+	for (let index = 0; index < 20; index++) cursor = cursor.next = { index };
+	tracker
+		.createHandler()
+		.handleToolStart(
+			{ id: ['Tool'] },
+			{ items: Array.from({ length: 10000 }, (_, index) => index), deep },
+			'tool-1',
+		);
+	tracker.createHandler().handleToolEnd('done', 'tool-1');
+	const input = attrMap(spans[0])['gen_ai.tool.call.arguments'];
+	assert.ok(String(input).includes('[items truncated]'));
+	assert.ok(String(input).includes('[max depth]'));
+	assert.ok(String(input).length < 10000);
 });
 
 test('V3 Calling <tool> message reconstructs a tool when gpt-5 Responses omits tool_calls', () => {
@@ -784,7 +1140,7 @@ test('a hostile message property getter cannot abort synthesis or the next LLM r
 	);
 });
 
-test('wholesale synthesis failure (hostile messages container) still opens the LLM run', () => {
+test('tool synthesis does not call an untrusted messages.flat implementation', () => {
 	const spans = [];
 	const tracker = new RunTreeTracker({ ...baseConfig, singleTrace: true }, (s) => spans.push(s));
 	const handler = tracker.createHandler();
@@ -796,7 +1152,12 @@ test('wholesale synthesis failure (hostile messages container) still opens the L
 	};
 	handler.handleChatModelStart(OPENAI_SERIALIZED, messages, 'run-2', 'agent-run');
 	handler.handleLLMEnd(OPENAI_RESULT, 'run-2');
-	assert.ok(tracker.handlerErrors >= 1, 'the wholesale failure was counted');
+	assert.equal(tracker.handlerErrors, 0);
+	assert.equal(
+		spans.filter((s) => s.name === 'execute_tool calc').length,
+		1,
+		'the result still matches without using Array.prototype.flat',
+	);
 	assert.equal(
 		spans.filter((s) => s.name.startsWith('chat ')).length,
 		2,

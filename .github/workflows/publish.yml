@@ -103,6 +103,12 @@ jobs:
             echo "already-published=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Run tests
+        run: npm test
+
+      - name: Verify package contents
+        run: npm pack --dry-run --ignore-scripts
+
       - name: Release
         if: steps.preflight.outputs.already-published != 'true'
         # Publishes to npm with a provenance attestation (requires id-token: write above).

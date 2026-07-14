@@ -5,6 +5,15 @@ import { TraceExporter } from '../dist/nodes/TraceExporter/TraceExporter.node.js
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
+function spanAttributes(span) {
+	return Object.fromEntries(
+		span.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+}
+
 const PARAM_DEFAULTS = {
 	traceName: '',
 	sessionId: '',
@@ -28,6 +37,10 @@ function fakeCtx({
 	supplyAsArray = true,
 	typeVersion = 1,
 	parameters = {},
+	mode = 'manual',
+	executionContext = {},
+	metadataTracing = {},
+	metadataWrites = [],
 } = {}) {
 	return {
 		getInputConnectionData: async () => (supplyAsArray ? [model] : model),
@@ -53,7 +66,17 @@ function fakeCtx({
 		},
 		getWorkflow: () => ({ id: 'wf-supply', name: 'Supply Data WF', active: false }),
 		getExecutionId: () => executionId,
-		getNode: () => ({ name: 'AI Trace Exporter', typeVersion }),
+		getNode: () => ({
+			name: 'AI Trace Exporter',
+			id: 'trace-exporter-node',
+			type: 'n8n-nodes-observability.traceExporter',
+			typeVersion,
+		}),
+		getWorkflowDataProxy: () => ({ $thisRunIndex: 0 }),
+		getMode: () => mode,
+		getExecutionContext: () => executionContext,
+		getExecuteData: () => ({ metadata: { tracing: metadataTracing } }),
+		setMetadata: (metadata) => metadataWrites.push(metadata),
 	};
 }
 
@@ -202,6 +225,23 @@ test('description exposes observability search aliases without claiming tool sup
 	}
 });
 
+test('version 3 identity and structured-redaction fields stay in their advanced groups', () => {
+	const { properties } = new TraceExporter().description;
+	const privacyOptions = properties.find((property) => property.name === 'privacyOptions').options;
+	const traceAttributes = properties.find(
+		(property) => property.name === 'traceAttributes',
+	).options;
+	const structuredPaths = privacyOptions.find(
+		(property) => property.name === 'redactionFieldPaths',
+	);
+	assert.equal(structuredPaths.displayOptions.show['@version'][0]._cnd.gte, 3);
+	for (const name of ['agentName', 'agentVersion', 'promptName', 'promptVersion']) {
+		const property = traceAttributes.find((candidate) => candidate.name === name);
+		assert.ok(property, `missing Trace Attributes field: ${name}`);
+		assert.equal(property.displayOptions.show['@version'][0]._cnd.gte, 3);
+	}
+});
+
 test('current node version is an integer that n8n can persist during community install', () => {
 	const { version } = new TraceExporter().description;
 	const metadata = JSON.parse(
@@ -210,11 +250,165 @@ test('current node version is an integer that n8n can persist during community i
 			'utf8',
 		),
 	);
-	assert.deepEqual(version, [1, 1.1, 2], 'keep 1.1 workflows compatible while making 2 current');
+	assert.deepEqual(
+		version,
+		[1, 1.1, 2, 3],
+		'keep historical workflows compatible while making 3 current',
+	);
 	const latestVersion = version.at(-1);
-	assert.equal(latestVersion, 2);
+	assert.equal(latestVersion, 3);
 	assert.equal(Number.isInteger(latestVersion), true, 'n8n persists the latest version as integer');
 	assert.equal(Number(metadata.nodeVersion), latestVersion, 'packaged metadata matches runtime');
+});
+
+test('node version 3 exports structured identity/context fields and correlates native metadata', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const metadataWrites = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		metadataWrites,
+		metadataTracing: { native_span: 'present', attempt: 2, cached: false },
+		executionId: 'exec-supply-data-v3',
+		typeVersion: 3,
+		mode: 'webhook',
+		executionContext: {
+			parentExecutionId: 'parent-execution-7',
+			redaction: { version: 1, policy: 'none' },
+		},
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: false,
+			privacyOptions: {
+				maxPayloadSizeKb: 8,
+				redactionPatterns: [],
+				redactionFieldPaths: ['$..content'],
+			},
+			traceAttributes: {
+				agentName: 'support-router',
+				agentVersion: '3.4.1',
+				promptName: 'route-ticket',
+				promptVersion: '12',
+				serviceName: 'support-agent',
+			},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	const result = await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'customer-secret', _getType: () => 'human' }]],
+		'run-v3',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: 'public-answer' }]] }, 'run-v3');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	const llm = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	const llmAttrs = spanAttributes(llm);
+	const rootAttrs = spanAttributes(root);
+	assert.equal(rootAttrs['gen_ai.agent.name'], 'support-router');
+	assert.equal(llmAttrs['gen_ai.agent.version'], '3.4.1');
+	assert.equal(llmAttrs['gen_ai.prompt.name'], 'route-ticket');
+	assert.equal(llmAttrs['gen_ai.prompt.version'], '12');
+	assert.equal(llmAttrs['n8n.execution.mode'], 'webhook');
+	assert.equal(llmAttrs['n8n.execution.parent.id'], 'parent-execution-7');
+	assert.match(String(llmAttrs['gen_ai.input.messages']), /\[REDACTED\]/);
+	assert.doesNotMatch(JSON.stringify(spans), /customer-secret/);
+
+	await result.closeFunction();
+	assert.equal(metadataWrites.length, 1);
+	assert.deepEqual(metadataWrites[0].tracing.native_span, 'present');
+	assert.equal(metadataWrites[0].tracing.attempt, 2);
+	assert.equal(metadataWrites[0].tracing.cached, false);
+	assert.match(metadataWrites[0].tracing.ai_observability_trace_id, /^[0-9a-f]{32}$/);
+	assert.match(metadataWrites[0].tracing.ai_observability_root_span_id, /^[0-9a-f]{16}$/);
+});
+
+test('n8n execution redaction policy hard-disables prompt, response, and tool payload capture', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-redaction-ceiling',
+		typeVersion: 3,
+		mode: 'manual',
+		executionContext: {
+			redaction: { version: 2, production: false, manual: true },
+		},
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: true,
+			privacyOptions: {},
+			traceAttributes: {},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'blocked-prompt', _getType: () => 'human' }]],
+		'run-blocked-tool',
+	);
+	handler.handleLLMEnd(
+		{
+			generations: [
+				[
+					{
+						text: '',
+						message: {
+							tool_calls: [
+								{ id: 'blocked-call', name: 'lookup', args: { token: 'blocked-argument' } },
+							],
+						},
+					},
+				],
+			],
+		},
+		'run-blocked-tool',
+	);
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[
+			[
+				{
+					tool_call_id: 'blocked-call',
+					content: 'blocked-result',
+					_getType: () => 'tool',
+				},
+			],
+		],
+		'run-blocked-answer',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: 'blocked-response' }]] }, 'run-blocked-answer');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	assert.ok(spans.some((span) => span.name === 'execute_tool lookup'));
+	assert.doesNotMatch(
+		JSON.stringify(spans),
+		/blocked-prompt|blocked-argument|blocked-result|blocked-response/,
+	);
+	for (const span of spans) {
+		assert.equal(spanAttributes(span)['n8n.content.capture.blocked'], true);
+	}
 });
 
 test('node version 1.1 reads visible capture and grouped advanced settings', async () => {
@@ -225,6 +419,7 @@ test('node version 1.1 reads visible capture and grouped advanced settings', asy
 		httpCalls,
 		executionId: 'exec-supply-data-v1-1',
 		typeVersion: 1.1,
+		executionContext: { redaction: { version: 1, policy: 'none' } },
 		parameters: {
 			capturePrompts: true,
 			captureToolIO: false,
@@ -280,6 +475,7 @@ test('node version 1 keeps legacy nested capture settings', async () => {
 		httpCalls,
 		executionId: 'exec-supply-data-v1-legacy',
 		typeVersion: 1,
+		executionContext: { redaction: { version: 1, policy: 'none' } },
 		parameters: {
 			options: { capturePrompts: true, captureToolIO: false },
 		},
