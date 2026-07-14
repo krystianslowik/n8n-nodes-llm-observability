@@ -16,6 +16,10 @@ flowchart LR
     exporter -->|"Traced Chat Model"| agent["AI Agent"]
 ```
 
+![AI Trace Exporter connected between an OpenAI Chat Model and an AI Agent in n8n](https://raw.githubusercontent.com/krystianslowik/n8n-nodes-llm-observability/main/assets/screenshots/n8n-ai-trace-exporter-workflow.png)
+
+_The exporter sits between the Chat Model and AI Agent and turns green when the model runs._
+
 ## What a trace looks like
 
 One trace per agent execution (n8n execution ID), named after the **Trace Name**
@@ -31,6 +35,10 @@ flowchart TD
     trace --> tool
     trace --> final
 ```
+
+![An n8n AI Agent trace in Opik with two model calls and a Calculator tool call](https://raw.githubusercontent.com/krystianslowik/n8n-nodes-llm-observability/main/assets/screenshots/opik-ai-agent-trace.png)
+
+_One agent execution in Opik: two model calls and the reconstructed Calculator call in a single trace._
 
 Spans use OTel GenAI semantic-convention attributes; backends that map them
 (e.g. Opik) derive model, provider, per-call token usage, and cost from the
