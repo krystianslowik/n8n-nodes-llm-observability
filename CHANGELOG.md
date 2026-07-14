@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.1.7 - 2026-07-14
+
+### Added
+
+- Add n8n workflow and Opik trace screenshots showing where the AI Trace
+  Exporter sits and what one exported agent execution contains.
+
 ## 0.1.6 - 2026-07-13
 
 ### Fixed
