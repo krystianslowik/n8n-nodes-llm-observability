@@ -12,7 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  quality:
+    name: Quality and package
     runs-on: ubuntu-latest
 
     steps:
@@ -30,8 +31,41 @@ jobs:
       - name: Run lint
         run: npm run lint
 
-      - name: Run build
+      - name: Run tests
+        run: npm test
+
+      - name: Verify package contents
+        run: npm pack --dry-run --ignore-scripts
+
+  n8n-compatibility:
+    name: n8n-workflow ${{ matrix.n8n-workflow }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        n8n-workflow:
+          - '~2.27.0'
+          - '~2.28.0'
+          - '~2.29.0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up minimum supported Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.0'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Select n8n compatibility target
+        run: npm install --no-save --package-lock=false "n8n-workflow@${{ matrix.n8n-workflow }}"
+
+      - name: Build against target n8n version
         run: npm run build
 
-      - name: Run tests
+      - name: Run contract tests
         run: node --test tests/*.test.mjs

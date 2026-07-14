@@ -1,6 +1,6 @@
 {
 	"node": "n8n-nodes-observability",
-	"nodeVersion": "2.0",
+	"nodeVersion": "3.0",
 	"codexVersion": "1.0",
 	"categories": ["AI"],
 	"alias": [
