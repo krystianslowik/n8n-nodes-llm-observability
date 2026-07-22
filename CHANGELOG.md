@@ -2,6 +2,98 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.0 - 2026-07-14
+
+### Added
+
+- Add count- and byte-bounded OTLP batching, a process-wide request limiter,
+  selective network/HTTP retries with `Retry-After`, partial-success parsing,
+  and exporter delivery diagnostics.
+- Add deterministic root-trace sampling; root-level model, tool, error, and
+  token totals; cache-read, cache-creation, and reasoning-token usage; and
+  streaming time-to-first-chunk measurement when callbacks provide it.
+- Add version 3 agent/prompt identity fields and structured JSON redaction for
+  object members, quoted keys, array wildcards, and recursive member matches.
+- Add best-effort correlation IDs to n8n native tracing metadata when the
+  runtime exposes that capability.
+- Add CI build and contract-test coverage for `n8n-workflow` 2.27, 2.28, and
+  2.29 on Node.js 22.22.
+
+### Changed
+
+- Isolate traces by execution, Trace Exporter node, parent run index, item, and
+  parallel fan-out slot while preserving one trace across steppable-agent
+  model/tool steps.
+- Bound callback state, tool/message serialization, regex work, and redaction
+  input so malformed provider data cannot grow memory or block the event loop.
+- Treat n8n execution-content redaction as a hard ceiling over the node's
+  prompt/response and tool-I/O capture settings.
+- Normalize provider/model and multi-candidate response data before emitting
+  GenAI attributes.
+
+### Fixed
+
+- Finalize terminal answers, errors, cancellation, and abandoned tool tails
+  without leaking stale callbacks into a reused model.
+- Mark reconstructed tool timing explicitly as inferred and retain pending
+  tools until a result is observed or the execution is finalized.
+- Give execution close a 250 ms best-effort exporter flush and report timeout,
+  partial acceptance, final failure, and queue overflow as warnings without
+  failing the workflow.
+- Isolate synthetic roots into singleton OTLP requests so an Opik duplicate-root
+  conflict cannot reject child spans queued beside it.
+- Retry a terminal root after the in-flight flush reports failure, and run the
+  test/package gates in the tag-triggered publish workflow before npm release.
+- Normalize exporter warnings to local status/category text so backend error
+  bodies cannot echo captured content into n8n logs or diagnostics.
+- Preserve structured JSON answers and emit schema-complete tool-response and
+  output-message fields.
+
+## 0.1.7 - 2026-07-14
+
+### Added
+
+- Add n8n workflow and Opik trace screenshots showing where the AI Trace
+  Exporter sits and what one exported agent execution contains.
+
+## 0.1.6 - 2026-07-13
+
+### Fixed
+
+- Make node version 2 the current version so PostgreSQL-backed n8n instances
+  can persist the community-node record during installation. Version 1.1
+  remains available for workflows created with 0.1.5.
+
+## 0.1.5 - 2026-07-13
+
+### Added
+
+- Add Language Model picker aliases for observability, OpenTelemetry, OTLP,
+  Opik, Langfuse, and Datadog.
+- Add explicit sampled/not-sampled execution data, truthful background queue
+  status, and execution warnings for setup, redaction, and queue problems.
+
+### Changed
+
+- Rename the node to **AI Trace Exporter**, replace its icon, label both model
+  connections, and group privacy, trace attribute, and export settings in node
+  version 1.1 while preserving version 1 workflow parameters.
+- Replace the credential's preset form with guided backend setup and explicit,
+  backward-compatible endpoint authentication.
+- Document Datadog through an OpenTelemetry Collector; the Datadog site and API
+  key now stay on the collector's Datadog exporter instead of being sent to its
+  OTLP receiver.
+- Replace README ASCII diagrams with Mermaid and align all labels with the n8n
+  editor.
+
+### Fixed
+
+- Preserve explicit authentication on existing Langfuse, Opik, and collector
+  credentials instead of silently forcing a backend-specific mode.
+- Keep existing traced-model output fan-out valid while restricting the input
+  to one Chat Model.
+- Correct package metadata and documentation anchors used by n8n discovery.
+
 ## 0.1.4 - 2026-07-10
 
 ### Added
@@ -53,7 +145,7 @@ All notable changes to this project will be documented in this file.
 
 - **One agent execution is one trace again on n8n's steppable Tools Agent
   (V3, the current default).** n8n runs `supplyData` close hooks after every
-  agent *step*, not at execution end; previous versions evicted the
+  agent _step_, not at execution end; previous versions evicted the
   per-execution tracing pipeline there, splitting one run into one trace per
   LLM call and losing the pending tool-call ledger (so no tool spans). The
   close hook now only marks the pipeline; eviction happens lazily after a

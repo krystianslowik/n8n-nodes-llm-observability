@@ -17,10 +17,16 @@ const OPTIONS = {
 	maxPayloadSizeKb: 32,
 	samplingRatePercent: 100,
 	redactionPatterns: [],
+	redactionFieldPaths: [],
 	environment: 'test',
 	tags: ['smoke', 'agent'],
 	release: 'release-1',
 	serviceName: 'support-automation',
+	agentName: '',
+	agentVersion: '',
+	promptName: '',
+	promptVersion: '',
+	contentCaptureBlocked: false,
 	itemIndex: 0,
 };
 
@@ -34,11 +40,11 @@ const OPENAI_SERIALIZED = {
 	kwargs: { model: 'gpt-4o-mini' },
 };
 
-// NOTE: wrapModelWithTracing keeps a module-level pipeline registry keyed on
-// (executionId, node name), so every test must use a UNIQUE execution id to
-// stay isolated from the others.
-function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
-	return {
+// NOTE: wrapModelWithTracing keeps a module-level pipeline registry, so every
+// test must use a UNIQUE execution id to stay isolated from the others.
+function fakeCtx(httpCalls, logs = [], executionId = 'exec-7', hints = [], lifecycle = {}) {
+	const cancellationHandlers = lifecycle.cancellationHandlers ?? [];
+	const ctx = {
 		helpers: {
 			httpRequest: async (options) => {
 				httpCalls.push(options);
@@ -50,10 +56,22 @@ function fakeCtx(httpCalls, logs = [], executionId = 'exec-7') {
 			error: (m) => logs.push(['error', m]),
 			debug: (m) => logs.push(['debug', m]),
 		},
+		addExecutionHints: (...values) => hints.push(...values),
 		getWorkflow: () => ({ id: 'wf-9', name: 'Spike WF', active: false }),
 		getExecutionId: () => executionId,
-		getNode: () => ({ name: 'Trace Exporter', id: 'node-1', type: 'traceExporter' }),
+		getNode: () => ({
+			name: lifecycle.nodeName ?? 'Trace Exporter',
+			id: lifecycle.nodeId ?? 'node-1',
+			type: 'traceExporter',
+		}),
+		getWorkflowDataProxy: () => ({ $thisRunIndex: lifecycle.runIndex ?? 0 }),
+		onExecutionCancellation: (handler) => cancellationHandlers.push(handler),
+		getExecutionCancelSignal: () => lifecycle.cancelSignal,
 	};
+	ctx.cancelExecution = () => {
+		for (const handler of cancellationHandlers) handler();
+	};
+	return ctx;
 }
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
@@ -199,6 +217,7 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	assert.equal(attrs['n8n.execution.id'], 'exec-e2e');
 	assert.equal(attrs['n8n.node.id'], 'node-1');
 	assert.equal(attrs['n8n.node.type'], 'traceExporter');
+	assert.equal(attrs['n8n.node.run.index'], '0');
 	assert.equal(attrs['deployment.environment.name'], 'test');
 	assert.equal(attrs['langfuse.release'], 'release-1');
 	assert.equal(attrs['n8n.metadata.env'], 'test');
@@ -224,6 +243,52 @@ test('wrapModelWithTracing returns the same instance and exports a span end-to-e
 	assert.equal(resourceAttrs['service.version'], 'release-1');
 });
 
+test('execution feedback distinguishes sampled and queued without claiming delivery', () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	const returned = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-feedback-sampled'),
+		model,
+		OPTIONS,
+		CREDENTIAL,
+	);
+	assert.equal(returned.getTraceContext(), undefined, 'sampling is undecided before model start');
+
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	const started = returned.getTraceContext();
+	assert.equal(started.tracing, 'attached');
+	assert.equal(started.sampling, 'sampled');
+	assert.equal('exportStatus' in started, false, 'nothing is queued before a span ends');
+	assert.match(started.traceId, /^[0-9a-f]{32}$/);
+
+	handler.handleLLMEnd({}, 'run-1');
+	const ended = returned.getTraceContext();
+	assert.equal(ended.exportStatus, 'queued');
+	assert.equal('delivered' in ended, false, 'background export is never reported as delivered');
+});
+
+test('unsampled execution feedback exposes no trace IDs and sends no spans', () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	const returned = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-feedback-unsampled'),
+		model,
+		{ ...OPTIONS, samplingRatePercent: 0 },
+		CREDENTIAL,
+	);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+
+	assert.deepEqual(returned.getTraceContext(), {
+		tracing: 'attached',
+		sampling: 'notSampled',
+		exportStatus: 'notSampled',
+	});
+	assert.equal(httpCalls.length, 0);
+});
+
 test('configured redaction also sanitizes metadata and tags before they become searchable attributes', async () => {
 	const httpCalls = [];
 	const model = { callbacks: [] };
@@ -244,6 +309,43 @@ test('configured redaction also sanitizes metadata and tags before they become s
 	await flushMicrotasks();
 	assert.ok(!JSON.stringify(httpCalls).includes('secret-'));
 	assert.ok(JSON.stringify(httpCalls).includes('[REDACTED]'));
+});
+
+test('structured metadata redaction happens before per-key attributes are flattened', async () => {
+	const httpCalls = [];
+	const model = { callbacks: [] };
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-structured-metadata-redaction'),
+		model,
+		{
+			...OPTIONS,
+			metadata: {
+				user: { email: 'metadata-secret@example.com', displayName: 'Visible' },
+			},
+			redactionFieldPaths: ['$.user.email'],
+		},
+		CREDENTIAL,
+	);
+	model.callbacks[0].handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	model.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer' }]] }, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const payload = JSON.stringify(httpCalls);
+	assert.equal(payload.includes('metadata-secret@example.com'), false);
+	assert.match(payload, /\[REDACTED\]/);
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	for (const span of spans) {
+		const attrs = Object.fromEntries(
+			span.attributes.map(({ key, value }) => [key, value.stringValue]),
+		);
+		assert.match(attrs['n8n.metadata.user'], /\[REDACTED\]/);
+		assert.match(attrs['langfuse.trace.metadata.user'], /\[REDACTED\]/);
+	}
 });
 
 test('empty Session ID / User ID emit NO session, thread, or user attributes', async () => {
@@ -291,10 +393,94 @@ test('export failure is swallowed: no unhandled rejection, warning logged', asyn
 		await flushMicrotasks();
 		await flushMicrotasks();
 		assert.equal(unhandled, 0);
-		assert.ok(logs.some(([level, message]) => level === 'warn' && /opik down/.test(message)));
+		assert.ok(
+			logs.some(
+				([level, message]) =>
+					level === 'warn' && /OTLP export failed \(unknown transport error\)/.test(message),
+			),
+		);
+		assert.doesNotMatch(JSON.stringify(logs), /opik down/);
 	} finally {
 		process.off('unhandledRejection', onUnhandled);
 	}
+});
+
+test('background export failures do not claim a persisted execution hint', async () => {
+	const logs = [];
+	const hints = [];
+	const ctx = fakeCtx([], logs, 'exec-export-hint', hints);
+	ctx.helpers.httpRequest = async () => {
+		throw Object.assign(new Error('secret backend response'), { httpCode: '401' });
+	};
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-1');
+	handler.handleLLMEnd({}, 'run-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	assert.equal(
+		hints.length,
+		0,
+		'a detached HTTP failure can happen after addOutputData persisted the sub-node run',
+	);
+	assert.ok(
+		logs.some(
+			([level, message]) => level === 'warn' && /OTLP export failed \(HTTP 401\)/.test(message),
+		),
+	);
+	assert.doesNotMatch(JSON.stringify(logs), /secret backend response/);
+});
+
+test('invalid redaction patterns and callback attachment failures add deduplicated hints', () => {
+	const hints = [];
+	const ctx = fakeCtx([], [], 'exec-configuration-hints', hints);
+	const model = { callbacks: {} };
+	wrapModelWithTracing(ctx, model, { ...OPTIONS, redactionPatterns: ['['] }, CREDENTIAL);
+	wrapModelWithTracing(ctx, { callbacks: {} }, OPTIONS, CREDENTIAL);
+
+	assert.equal(hints.filter((hint) => /redaction pattern/.test(hint.message)).length, 1);
+	assert.equal(hints.filter((hint) => /could not attach/.test(hint.message)).length, 1);
+});
+
+test('setup failures add one hint while preserving model passthrough', () => {
+	const hints = [];
+	const ctx = fakeCtx([], [], 'exec-setup-hint', hints);
+	const credential = {
+		authType: 'customHeaders',
+		get endpointUrl() {
+			throw new Error('broken credential value');
+		},
+	};
+	const modelA = { callbacks: [] };
+	const modelB = { callbacks: [] };
+	assert.equal(wrapModelWithTracing(ctx, modelA, OPTIONS, credential).model, modelA);
+	assert.equal(wrapModelWithTracing(ctx, modelB, OPTIONS, credential).model, modelB);
+	assert.equal(hints.filter((hint) => /setup failed/.test(hint.message)).length, 1);
+});
+
+test('queue overflow adds one execution hint while export remains non-blocking', async () => {
+	const hints = [];
+	let releasePost;
+	const gate = new Promise((resolve) => {
+		releasePost = resolve;
+	});
+	const ctx = fakeCtx([], [], 'exec-queue-hint', hints);
+	ctx.helpers.httpRequest = () => gate;
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	const handler = model.callbacks[0];
+	for (let index = 0; index < 205; index++) {
+		const runId = `run-${index}`;
+		handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], runId);
+		handler.handleLLMEnd({}, runId);
+	}
+
+	assert.equal(hints.filter((hint) => /queue is full/.test(hint.message)).length, 1);
+	releasePost();
+	await flushMicrotasks();
 });
 
 test('wrapModelWithTracing never throws — broken ctx still returns the model', () => {
@@ -305,13 +491,17 @@ test('wrapModelWithTracing never throws — broken ctx still returns the model',
 	assert.equal(returned.closeFunction, undefined, 'failure path returns no closeFunction');
 });
 
-test('one execution shares one pipeline: spans from separate wrap calls share a traceId', async () => {
+test('parallel wraps on one execution boundary get separate pipelines instead of merging fan-out', async () => {
 	const httpCalls = [];
 	const modelA = { callbacks: [] };
 	const modelB = { callbacks: [] };
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-shared'), modelA, OPTIONS, CREDENTIAL);
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-shared'), modelB, OPTIONS, CREDENTIAL);
-	assert.equal(modelA.callbacks[0], modelB.callbacks[0], 'same handler reused for one execution');
+	assert.notEqual(
+		modelA.callbacks[0],
+		modelB.callbacks[0],
+		'open fan-out slots never share a handler',
+	);
 	modelA.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-a');
 	modelA.callbacks[0].handleLLMEnd({ generations: [[{ text: 'answer-a' }]] }, 'run-a');
 	modelB.callbacks[0].handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-b');
@@ -319,17 +509,35 @@ test('one execution shares one pipeline: spans from separate wrap calls share a 
 	await flushMicrotasks();
 	await flushMicrotasks();
 	const spans = httpCalls.flatMap((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	// synthetic root + 2 llm spans, all in one trace
-	assert.equal(spans.length, 3);
-	assert.ok(
-		spans.every((s) => s.traceId === spans[0].traceId),
-		'one execution -> one trace',
+	assert.equal(spans.length, 4, 'each fan-out slot exports one LLM span and one root');
+	assert.equal(new Set(spans.map((span) => span.traceId)).size, 2);
+});
+
+test('item and parent run indexes are stable invocation boundaries', () => {
+	const httpCalls = [];
+	const itemZero = { callbacks: [] };
+	const itemOne = { callbacks: [] };
+	const nextRun = { callbacks: [] };
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-boundaries', [], { runIndex: 3 }),
+		itemZero,
+		{ ...OPTIONS, itemIndex: 0 },
+		CREDENTIAL,
 	);
-	const root = spans.find((span) => span.parentSpanId === undefined);
-	const [llm1, llm2] = spans.filter((span) => span.name.startsWith('chat '));
-	assert.equal(llm1.parentSpanId, root.spanId);
-	assert.equal(llm2.parentSpanId, root.spanId);
-	assert.notEqual(llm1.spanId, llm2.spanId);
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-boundaries', [], { runIndex: 3 }),
+		itemOne,
+		{ ...OPTIONS, itemIndex: 1 },
+		CREDENTIAL,
+	);
+	wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-boundaries', [], { runIndex: 4 }),
+		nextRun,
+		{ ...OPTIONS, itemIndex: 0 },
+		CREDENTIAL,
+	);
+	assert.notEqual(itemZero.callbacks[0], itemOne.callbacks[0]);
+	assert.notEqual(itemZero.callbacks[0], nextRun.callbacks[0]);
 });
 
 test('different executions get different pipelines and traces', async () => {
@@ -352,16 +560,155 @@ test('different executions get different pipelines and traces', async () => {
 	assert.equal(traceIds.size, 2);
 });
 
+test('a terminal answer closes the invocation before another wrap on the same boundary', () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-terminal-boundary');
+	const firstModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, firstModel, OPTIONS, CREDENTIAL);
+	const firstHandler = firstModel.callbacks[0];
+	firstHandler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-terminal');
+	firstHandler.handleLLMEnd({ generations: [[{ text: 'done' }]] }, 'run-terminal');
+
+	const secondModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, secondModel, OPTIONS, CREDENTIAL);
+	assert.notEqual(
+		secondModel.callbacks[0],
+		firstHandler,
+		'a later invocation cannot merge into a terminal trace',
+	);
+});
+
+test('terminal cleanup detaches the exact OTLP handler before a model instance is reused', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-terminal-model-reuse');
+	const model = { callbacks: [] };
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	const terminalHandler = model.callbacks[0];
+	terminalHandler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-terminal-reuse');
+	terminalHandler.handleLLMEnd(
+		{ generations: [[{ text: 'first invocation complete' }]] },
+		'run-terminal-reuse',
+	);
+	await flushMicrotasks();
+
+	assert.equal(model.callbacks.includes(terminalHandler), false, 'stale handler was detached');
+	wrapModelWithTracing(ctx, model, OPTIONS, CREDENTIAL);
+	assert.equal(model.callbacks.length, 1);
+	assert.notEqual(
+		model.callbacks[0],
+		terminalHandler,
+		'model receives only the next invocation handler',
+	);
+});
+
+test('V3 pipeline reuse registers only one cancellation listener', async () => {
+	const httpCalls = [];
+	const cancellationHandlers = [];
+	const lifecycle = { cancellationHandlers };
+	const firstCtx = fakeCtx(httpCalls, [], 'exec-cancellation-listener-once', [], lifecycle);
+	const firstModel = { callbacks: [] };
+	const first = wrapModelWithTracing(firstCtx, firstModel, OPTIONS, CREDENTIAL);
+	await first.closeFunction();
+
+	const secondCtx = fakeCtx(httpCalls, [], 'exec-cancellation-listener-once', [], lifecycle);
+	const secondModel = { callbacks: [] };
+	wrapModelWithTracing(secondCtx, secondModel, OPTIONS, CREDENTIAL);
+	assert.equal(cancellationHandlers.length, 1, 'one listener covers every step in the pipeline');
+});
+
+test('structured non-text output finalizes a root and closes the invocation', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-structured-terminal');
+	const firstModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, firstModel, OPTIONS, CREDENTIAL);
+	const firstHandler = firstModel.callbacks[0];
+	firstHandler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-structured');
+	firstHandler.handleLLMEnd(
+		{ generations: [[{ text: '', message: { content: { answer: 42 } } }]] },
+		'run-structured',
+	);
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) => call.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.ok(
+		spans.some((span) => span.parentSpanId === undefined),
+		'structured output emits a root',
+	);
+	const secondModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, secondModel, OPTIONS, CREDENTIAL);
+	assert.notEqual(secondModel.callbacks[0], firstHandler);
+});
+
+test('LLM errors finalize the invocation immediately', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-error-terminal');
+	const firstModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, firstModel, OPTIONS, CREDENTIAL);
+	const firstHandler = firstModel.callbacks[0];
+	firstHandler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-error');
+	firstHandler.handleLLMError(new Error('provider failed'), 'run-error');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) => call.body.resourceSpans[0].scopeSpans[0].spans);
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.equal(root.status.code, 2);
+	const secondModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, secondModel, OPTIONS, CREDENTIAL);
+	assert.notEqual(secondModel.callbacks[0], firstHandler);
+});
+
+test('n8n cancellation flushes a pending tool tail and closes the invocation', async () => {
+	const httpCalls = [];
+	const ctx = fakeCtx(httpCalls, [], 'exec-cancel-terminal');
+	const firstModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, firstModel, { ...OPTIONS, captureToolIO: true }, CREDENTIAL);
+	const firstHandler = firstModel.callbacks[0];
+	firstHandler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-tool-before-cancel');
+	firstHandler.handleLLMEnd(
+		{
+			generations: [
+				[
+					{
+						text: '',
+						message: { tool_calls: [{ id: 'cancelled-call', name: 'slow_tool', args: {} }] },
+					},
+				],
+			],
+		},
+		'run-tool-before-cancel',
+	);
+	ctx.cancelExecution();
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) => call.body.resourceSpans[0].scopeSpans[0].spans);
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	assert.equal(root.status.code, 2, 'cancelled root is marked as an error');
+	const tool = spans.find((span) => span.name === 'execute_tool slow_tool');
+	const toolAttrs = Object.fromEntries(
+		tool.attributes.map((attribute) => [attribute.key, Object.values(attribute.value)[0]]),
+	);
+	assert.equal(toolAttrs['n8n.tool.result_observed'], false);
+
+	const secondModel = { callbacks: [] };
+	wrapModelWithTracing(ctx, secondModel, OPTIONS, CREDENTIAL);
+	assert.notEqual(secondModel.callbacks[0], firstHandler);
+});
+
 test('root re-emits with the SAME spanId after its export batch fails, so late-arriving children stay valid', async () => {
 	const httpCalls = [];
-	let callCount = 0;
+	let rootFailures = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry');
-	// The final root ships after its child; fail only that second POST, then
-	// let every later batch succeed.
+	// Synthetic roots are isolated so a duplicate/conflicting root can never
+	// poison a child batch. Fail only the first root request.
 	ctx.helpers.httpRequest = async (options) => {
-		callCount++;
 		httpCalls.push(options);
-		if (callCount === 2) throw new Error('backend down for the root batch');
+		const spans = options.body.resourceSpans[0].scopeSpans[0].spans;
+		if (spans.some((span) => span.parentSpanId === undefined) && rootFailures++ === 0) {
+			throw Object.assign(new Error('backend rejected the first root'), { httpCode: '500' });
+		}
 	};
 
 	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, CREDENTIAL);
@@ -381,12 +728,12 @@ test('root re-emits with the SAME spanId after its export batch fails, so late-a
 	await flushMicrotasks();
 
 	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodies.length, 4, 'four POSTs: llm-1, failed root, llm-2, re-emitted root');
-
-	const [llm1] = bodies[0];
-	const [failedRoot] = bodies[1];
-	const [llm2] = bodies[2];
-	const [reEmittedRoot] = bodies[3];
+	assert.equal(bodies.length, 4, 'two child requests, failed root, then isolated root retry');
+	const llm1 = bodies[0].find((span) => span.name.startsWith('chat '));
+	const failedRoot = bodies[1].find((span) => span.parentSpanId === undefined);
+	const llm2 = bodies[2].find((span) => span.name.startsWith('chat '));
+	const reEmittedRoot = bodies[3].find((span) => span.parentSpanId === undefined);
+	assert.ok(llm1 && failedRoot && llm2 && reEmittedRoot);
 
 	assert.equal(failedRoot.parentSpanId, undefined, 'the root span itself has no parent');
 	assert.equal(reEmittedRoot.spanId, failedRoot.spanId, 'retry re-emits the SAME root spanId');
@@ -403,20 +750,23 @@ test('root re-emits with the SAME spanId after its export batch fails, so late-a
 
 test('a 409 on the root batch does NOT re-emit: the backend already has the root', async () => {
 	const httpCalls = [];
-	let callCount = 0;
+	let rootFailures = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-409');
-	// The root batch "fails" with a 409 — Opik answering "Trace already
-	// exists", e.g. after a client-side timeout on a POST the server ingested.
+	// The isolated root "fails" with a 409 — Opik answering "Trace already
+	// exists", for example after the server ingested a timed-out client POST.
 	ctx.helpers.httpRequest = async (options) => {
-		callCount++;
 		httpCalls.push(options);
-		if (callCount === 2) {
+		const spans = options.body.resourceSpans[0].scopeSpans[0].spans;
+		if (spans.some((span) => span.parentSpanId === undefined) && rootFailures++ === 0) {
 			// n8n NodeApiError shape: httpCode is a string
 			throw Object.assign(new Error('Conflict'), { httpCode: '409' });
 		}
 	};
 
-	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, CREDENTIAL);
+	const { model } = wrapModelWithTracing(ctx, { callbacks: [] }, OPTIONS, {
+		...CREDENTIAL,
+		preset: 'opik',
+	});
 	const handler = model.callbacks[0];
 
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-1');
@@ -435,13 +785,10 @@ test('a 409 on the root batch does NOT re-emit: the backend already has the root
 	assert.equal(
 		bodies.length,
 		3,
-		'three POSTs: llm-1, 409ed root, llm-2 — NO re-emitted root batch',
+		'three POSTs: child, isolated 409ed root, then llm-2 without a root retry',
 	);
-	const rootSpanId = bodies[1][0].spanId;
-	const laterSpanIds = bodies
-		.slice(2)
-		.flat()
-		.map((s) => s.spanId);
+	const rootSpanId = bodies[1].find((span) => span.parentSpanId === undefined).spanId;
+	const laterSpanIds = bodies[2].map((span) => span.spanId);
 	assert.ok(!laterSpanIds.includes(rootSpanId), 'no later batch carries a re-emitted root');
 });
 
@@ -483,13 +830,15 @@ test('non-numeric Max Payload Size falls back to the 32 KB default budget instea
 
 test('single-closeRun execution: closeFunction retries the failed root at execution end (and still evicts)', async () => {
 	const httpCalls = [];
-	let callCount = 0;
+	let rootFailures = 0;
 	const ctx = fakeCtx(httpCalls, [], 'exec-root-retry-at-close');
-	// Fail ONLY the root batch (which follows its child); the retry succeeds.
+	// Fail the first isolated root; the close-triggered root retry succeeds.
 	ctx.helpers.httpRequest = async (options) => {
-		callCount++;
 		httpCalls.push(options);
-		if (callCount === 2) throw new Error('backend down for the root batch');
+		const spans = options.body.resourceSpans[0].scopeSpans[0].spans;
+		if (spans.some((span) => span.parentSpanId === undefined) && rootFailures++ === 0) {
+			throw Object.assign(new Error('backend rejected the first root'), { httpCode: '500' });
+		}
 	};
 
 	const modelA = { callbacks: [] };
@@ -500,26 +849,18 @@ test('single-closeRun execution: closeFunction retries the failed root at execut
 	// so without the execution-end retry the trace stays orphaned forever.
 	handler.handleChatModelStart({ id: ['x', 'openai', 'ChatOpenAI'] }, [[]], 'run-only');
 	handler.handleLLMEnd({ generations: [[{ text: 'answer' }]] }, 'run-only');
-	await flushMicrotasks();
-	await flushMicrotasks();
-	await flushMicrotasks();
-
-	const bodiesBeforeClose = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(
-		bodiesBeforeClose.length,
-		2,
-		'before closeFunction: child + failed root were POSTed',
-	);
-
+	// Close immediately: the root failure arrives during the flush, after the
+	// pre-flush retry check that older implementations relied on.
 	await closeFunction();
 	await flushMicrotasks();
 	await flushMicrotasks();
 
 	const bodies = httpCalls.map((c) => c.body.resourceSpans[0].scopeSpans[0].spans);
-	assert.equal(bodies.length, 3, 'three POSTs: child, failed root, root retried at execution end');
-	const [child] = bodies[0];
-	const [failedRoot] = bodies[1];
+	assert.equal(bodies.length, 3, 'child, failed root, then root retried at execution end');
+	const child = bodies[0].find((span) => span.parentSpanId !== undefined);
+	const failedRoot = bodies[1].find((span) => span.parentSpanId === undefined);
 	const [retriedRoot] = bodies[2];
+	assert.ok(child && failedRoot && retriedRoot);
 	assert.equal(
 		retriedRoot.spanId,
 		failedRoot.spanId,
@@ -532,8 +873,8 @@ test('single-closeRun execution: closeFunction retries the failed root at execut
 		"child's parentSpanId matches the root the backend finally got",
 	);
 
-	// closeFunction does NOT evict (the steppable Tools Agent fires it after
-	// every step): same executionId keeps the SAME pipeline.
+	// The answer was terminal, so a later invocation on the same execution
+	// boundary must not inherit the completed trace.
 	const modelB = { callbacks: [] };
 	wrapModelWithTracing(
 		fakeCtx(httpCalls, [], 'exec-root-retry-at-close'),
@@ -541,10 +882,10 @@ test('single-closeRun execution: closeFunction retries the failed root at execut
 		OPTIONS,
 		CREDENTIAL,
 	);
-	assert.equal(modelB.callbacks[0], handler, 'the registry entry survives closeFunction');
+	assert.notEqual(modelB.callbacks[0], handler, 'a terminal pipeline is not reusable');
 });
 
-test('closeFunction keeps the pipeline (V3 steps); the lazy sweep evicts it after the linger window', async () => {
+test('closeFunction keeps a V3 continuation; the quiet backstop later finalizes it', async () => {
 	const httpCalls = [];
 	const modelA = { callbacks: [] };
 	const { closeFunction } = wrapModelWithTracing(
@@ -560,18 +901,22 @@ test('closeFunction keeps the pipeline (V3 steps); the lazy sweep evicts it afte
 
 	// Next agent step of the same execution: SAME handler, same trace.
 	const modelB = { callbacks: [] };
-	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelB, OPTIONS, CREDENTIAL);
+	const step2 = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], 'exec-close'),
+		modelB,
+		OPTIONS,
+		CREDENTIAL,
+	);
 	assert.equal(modelB.callbacks[0], handlerA, 'a step-end close must not split the execution');
 
-	// The step-2 wrap cleared the closed mark; a sweep now is a no-op even
-	// past the window.
+	// The step-2 wrap cleared the closed mark; a sweep is a no-op even past
+	// the window. Re-wrapping the same supplied model remains idempotent.
 	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
-	const modelC = { callbacks: [] };
-	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelC, OPTIONS, CREDENTIAL);
-	assert.equal(modelC.callbacks[0], handlerA, 'a live (re-opened) entry is never swept');
+	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelB, OPTIONS, CREDENTIAL);
+	assert.equal(modelB.callbacks[0], handlerA, 'a live (re-opened) entry is never swept');
 
 	// Close again and let it linger past the window: swept, fresh pipeline.
-	await closeFunction();
+	await step2.closeFunction();
 	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
 	const modelD = { callbacks: [] };
 	wrapModelWithTracing(fakeCtx(httpCalls, [], 'exec-close'), modelD, OPTIONS, CREDENTIAL);
@@ -648,6 +993,49 @@ test('V3 step cycle: supplyData → closeFunction → supplyData stays ONE trace
 		'a matched tool span carries no unmatched marker',
 	);
 	assert.equal(spans.filter((s) => s.name.startsWith('chat ')).length, 2, 'both LLM calls present');
+});
+
+test('quiet finalization flushes an unmatched tool tail without a later wrap call', async () => {
+	const httpCalls = [];
+	const execId = 'exec-quiet-tail';
+	const model = { callbacks: [] };
+	const wrapped = wrapModelWithTracing(
+		fakeCtx(httpCalls, [], execId),
+		model,
+		{ ...OPTIONS, captureToolIO: true },
+		CREDENTIAL,
+	);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(OPENAI_SERIALIZED, [[]], 'run-quiet-tool');
+	handler.handleLLMEnd(
+		{
+			generations: [
+				[
+					{
+						text: '',
+						message: { tool_calls: [{ id: 'quiet-call', name: 'quiet_tool', args: {} }] },
+					},
+				],
+			],
+		},
+		'run-quiet-tool',
+	);
+	await wrapped.closeFunction();
+	sweepStalePipelines(Date.now() + PIPELINE_LINGER_MS + 1000);
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) => call.body.resourceSpans[0].scopeSpans[0].spans);
+	assert.ok(
+		spans.some((span) => span.parentSpanId === undefined),
+		'quiet close emits the root',
+	);
+	const tool = spans.find((span) => span.name === 'execute_tool quiet_tool');
+	assert.ok(tool, 'the unmatched tool is not left waiting for unrelated future traffic');
+	const attrs = Object.fromEntries(
+		tool.attributes.map((attribute) => [attribute.key, Object.values(attribute.value)[0]]),
+	);
+	assert.equal(attrs['n8n.tool.result_observed'], false);
 });
 
 test('closeFunction is idempotent: calling it more than once never throws', async () => {

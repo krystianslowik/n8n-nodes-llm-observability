@@ -1,8 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { TraceExporter } from '../dist/nodes/TraceExporter/TraceExporter.node.js';
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+function spanAttributes(span) {
+	return Object.fromEntries(
+		span.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+}
 
 const PARAM_DEFAULTS = {
 	traceName: '',
@@ -20,10 +30,22 @@ const PARAM_DEFAULTS = {
  * the array traces nothing (measured live in the spike). `supplyData` keeps
  * a defensive unwrap to the first element; this file pins both shapes.
  */
-function fakeCtx({ model, httpCalls = [], executionId = 'exec-supply-data-1', supplyAsArray = true } = {}) {
+function fakeCtx({
+	model,
+	httpCalls = [],
+	executionId = 'exec-supply-data-1',
+	supplyAsArray = true,
+	typeVersion = 1,
+	parameters = {},
+	mode = 'manual',
+	executionContext = {},
+	metadataTracing = {},
+	metadataWrites = [],
+} = {}) {
 	return {
 		getInputConnectionData: async () => (supplyAsArray ? [model] : model),
 		getNodeParameter: (name, _itemIndex, fallback) => {
+			if (name in parameters) return parameters[name];
 			if (name in PARAM_DEFAULTS) return PARAM_DEFAULTS[name];
 			return fallback;
 		},
@@ -44,7 +66,17 @@ function fakeCtx({ model, httpCalls = [], executionId = 'exec-supply-data-1', su
 		},
 		getWorkflow: () => ({ id: 'wf-supply', name: 'Supply Data WF', active: false }),
 		getExecutionId: () => executionId,
-		getNode: () => ({ name: 'Trace Exporter' }),
+		getNode: () => ({
+			name: 'AI Trace Exporter',
+			id: 'trace-exporter-node',
+			type: 'n8n-nodes-observability.traceExporter',
+			typeVersion,
+		}),
+		getWorkflowDataProxy: () => ({ $thisRunIndex: 0 }),
+		getMode: () => mode,
+		getExecutionContext: () => executionContext,
+		getExecuteData: () => ({ metadata: { tracing: metadataTracing } }),
+		setMetadata: (metadata) => metadataWrites.push(metadata),
 	};
 }
 
@@ -57,14 +89,22 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 
 	// THE regression test: response must be the unwrapped model, not the
 	// array getInputConnectionData handed back.
-	assert.equal(result.response, model, 'response must be the unwrapped model, not the supplied array');
+	assert.equal(
+		result.response,
+		model,
+		'response must be the unwrapped model, not the supplied array',
+	);
 	assert.equal(model.callbacks.length, 2, 'OTLP and n8n execution-state handlers are attached');
 	assert.deepEqual(
 		model.callbacks.map((callback) => callback.name),
 		['n8nTraceExporterOtel', 'n8nTraceExporterExecutionState'],
 		'the non-mutating UI handler stays behind OTLP capture but ahead of the supplied model callbacks',
 	);
-	assert.equal(typeof result.closeFunction, 'function', 'supplyData wires up the eviction closeFunction');
+	assert.equal(
+		typeof result.closeFunction,
+		'function',
+		'supplyData wires up the eviction closeFunction',
+	);
 
 	const handler = model.callbacks[0];
 	handler.handleChatModelStart(
@@ -72,7 +112,10 @@ test('supplyData unwraps the array from getInputConnectionData and returns the m
 		[[{ content: 'hi' }]],
 		'run-1',
 	);
-	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } }, 'run-1');
+	handler.handleLLMEnd(
+		{ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } },
+		'run-1',
+	);
 	await flushMicrotasks();
 	await flushMicrotasks();
 
@@ -112,7 +155,11 @@ test('reusing a model replaces the stale UI handler and keeps OTLP first', async
 	assert.equal(model.callbacks.length, 2, 'no stale callback accumulates');
 	assert.equal(model.callbacks[0].name, 'n8nTraceExporterOtel');
 	assert.equal(model.callbacks[1].name, 'n8nTraceExporterExecutionState');
-	assert.notEqual(model.callbacks[1], firstUiHandler, 'the current step context replaces the old one');
+	assert.notEqual(
+		model.callbacks[1],
+		firstUiHandler,
+		'the current step context replaces the old one',
+	);
 });
 
 test('supplyData execution-state handler receives the OTLP trace IDs after the model starts', async () => {
@@ -147,9 +194,314 @@ test('supplyData execution-state handler receives the OTLP trace IDs after the m
 	assert.equal(outputJson.rootSpanId, inputJson.rootSpanId);
 });
 
-test('description declares a single ai_languageModel input capped at one connection', () => {
+test('description declares one required model input and one traced model output', () => {
 	const { description } = new TraceExporter();
-	assert.deepEqual(description.inputs, [{ type: 'ai_languageModel', maxConnections: 1 }]);
+	assert.deepEqual(description.inputs, [
+		{
+			type: 'ai_languageModel',
+			displayName: 'Chat Model',
+			required: true,
+			maxConnections: 1,
+		},
+	]);
+	assert.deepEqual(description.outputs, [
+		{
+			type: 'ai_languageModel',
+			displayName: 'Traced Chat Model',
+		},
+	]);
+	assert.equal(description.requiredInputs, 1);
+});
+
+test('description exposes observability search aliases without claiming tool support', () => {
+	const { description } = new TraceExporter();
+	assert.equal(description.usableAsTool, undefined);
+	assert.equal(
+		description.properties.find((property) => property.name === 'metadata').validateType,
+		'object',
+	);
+	for (const alias of ['LLM observability', 'OpenTelemetry', 'OTLP', 'Opik', 'Langfuse']) {
+		assert.ok(description.codex.alias.includes(alias), `missing picker alias: ${alias}`);
+	}
+});
+
+test('version 3 identity and structured-redaction fields stay in their advanced groups', () => {
+	const { properties } = new TraceExporter().description;
+	const privacyOptions = properties.find((property) => property.name === 'privacyOptions').options;
+	const traceAttributes = properties.find(
+		(property) => property.name === 'traceAttributes',
+	).options;
+	const structuredPaths = privacyOptions.find(
+		(property) => property.name === 'redactionFieldPaths',
+	);
+	assert.equal(structuredPaths.displayOptions.show['@version'][0]._cnd.gte, 3);
+	for (const name of ['agentName', 'agentVersion', 'promptName', 'promptVersion']) {
+		const property = traceAttributes.find((candidate) => candidate.name === name);
+		assert.ok(property, `missing Trace Attributes field: ${name}`);
+		assert.equal(property.displayOptions.show['@version'][0]._cnd.gte, 3);
+	}
+});
+
+test('current node version is an integer that n8n can persist during community install', () => {
+	const { version } = new TraceExporter().description;
+	const metadata = JSON.parse(
+		readFileSync(
+			new URL('../dist/nodes/TraceExporter/TraceExporter.node.json', import.meta.url),
+			'utf8',
+		),
+	);
+	assert.deepEqual(
+		version,
+		[1, 1.1, 2, 3],
+		'keep historical workflows compatible while making 3 current',
+	);
+	const latestVersion = version.at(-1);
+	assert.equal(latestVersion, 3);
+	assert.equal(Number.isInteger(latestVersion), true, 'n8n persists the latest version as integer');
+	assert.equal(Number(metadata.nodeVersion), latestVersion, 'packaged metadata matches runtime');
+});
+
+test('node version 3 exports structured identity/context fields and correlates native metadata', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const metadataWrites = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		metadataWrites,
+		metadataTracing: { native_span: 'present', attempt: 2, cached: false },
+		executionId: 'exec-supply-data-v3',
+		typeVersion: 3,
+		mode: 'webhook',
+		executionContext: {
+			parentExecutionId: 'parent-execution-7',
+			redaction: { version: 1, policy: 'none' },
+		},
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: false,
+			privacyOptions: {
+				maxPayloadSizeKb: 8,
+				redactionPatterns: [],
+				redactionFieldPaths: ['$..content'],
+			},
+			traceAttributes: {
+				agentName: 'support-router',
+				agentVersion: '3.4.1',
+				promptName: 'route-ticket',
+				promptVersion: '12',
+				serviceName: 'support-agent',
+			},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	const result = await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'customer-secret', _getType: () => 'human' }]],
+		'run-v3',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: 'public-answer' }]] }, 'run-v3');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	const llm = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const root = spans.find((span) => span.parentSpanId === undefined);
+	const llmAttrs = spanAttributes(llm);
+	const rootAttrs = spanAttributes(root);
+	assert.equal(rootAttrs['gen_ai.agent.name'], 'support-router');
+	assert.equal(llmAttrs['gen_ai.agent.version'], '3.4.1');
+	assert.equal(llmAttrs['gen_ai.prompt.name'], 'route-ticket');
+	assert.equal(llmAttrs['gen_ai.prompt.version'], '12');
+	assert.equal(llmAttrs['n8n.execution.mode'], 'webhook');
+	assert.equal(llmAttrs['n8n.execution.parent.id'], 'parent-execution-7');
+	assert.match(String(llmAttrs['gen_ai.input.messages']), /\[REDACTED\]/);
+	assert.doesNotMatch(JSON.stringify(spans), /customer-secret/);
+
+	await result.closeFunction();
+	assert.equal(metadataWrites.length, 1);
+	assert.deepEqual(metadataWrites[0].tracing.native_span, 'present');
+	assert.equal(metadataWrites[0].tracing.attempt, 2);
+	assert.equal(metadataWrites[0].tracing.cached, false);
+	assert.match(metadataWrites[0].tracing.ai_observability_trace_id, /^[0-9a-f]{32}$/);
+	assert.match(metadataWrites[0].tracing.ai_observability_root_span_id, /^[0-9a-f]{16}$/);
+});
+
+test('n8n execution redaction policy hard-disables prompt, response, and tool payload capture', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-redaction-ceiling',
+		typeVersion: 3,
+		mode: 'manual',
+		executionContext: {
+			redaction: { version: 2, production: false, manual: true },
+		},
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: true,
+			privacyOptions: {},
+			traceAttributes: {},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'blocked-prompt', _getType: () => 'human' }]],
+		'run-blocked-tool',
+	);
+	handler.handleLLMEnd(
+		{
+			generations: [
+				[
+					{
+						text: '',
+						message: {
+							tool_calls: [
+								{ id: 'blocked-call', name: 'lookup', args: { token: 'blocked-argument' } },
+							],
+						},
+					},
+				],
+			],
+		},
+		'run-blocked-tool',
+	);
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[
+			[
+				{
+					tool_call_id: 'blocked-call',
+					content: 'blocked-result',
+					_getType: () => 'tool',
+				},
+			],
+		],
+		'run-blocked-answer',
+	);
+	handler.handleLLMEnd({ generations: [[{ text: 'blocked-response' }]] }, 'run-blocked-answer');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	assert.ok(spans.some((span) => span.name === 'execute_tool lookup'));
+	assert.doesNotMatch(
+		JSON.stringify(spans),
+		/blocked-prompt|blocked-argument|blocked-result|blocked-response/,
+	);
+	for (const span of spans) {
+		assert.equal(spanAttributes(span)['n8n.content.capture.blocked'], true);
+	}
+});
+
+test('node version 1.1 reads visible capture and grouped advanced settings', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-v1-1',
+		typeVersion: 1.1,
+		executionContext: { redaction: { version: 1, policy: 'none' } },
+		parameters: {
+			capturePrompts: true,
+			captureToolIO: false,
+			privacyOptions: { maxPayloadSizeKb: 8, redactionPatterns: [] },
+			traceAttributes: {
+				environment: 'staging',
+				release: '1.1.0',
+				serviceName: 'support-agent',
+				tags: ['ux-test'],
+			},
+			exportOptions: { samplingRatePercent: 100 },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'visible prompt' }]],
+		'run-v1-1',
+	);
+	handler.handleLLMEnd({}, 'run-v1-1');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const resourceSpans = httpCalls.flatMap((call) => call.body.resourceSpans);
+	assert.ok(resourceSpans.length > 0);
+	const resourceAttributes = Object.fromEntries(
+		resourceSpans[0].resource.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+	assert.equal(resourceAttributes['service.name'], 'support-agent');
+	assert.equal(resourceAttributes['service.version'], '1.1.0');
+	const spans = resourceSpans.flatMap((group) => group.scopeSpans.flatMap((scope) => scope.spans));
+	const llmSpan = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const spanAttributes = Object.fromEntries(
+		llmSpan.attributes.map(({ key, value }) => [
+			key,
+			value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue,
+		]),
+	);
+	assert.match(String(spanAttributes['gen_ai.input.messages']), /visible prompt/);
+	assert.equal(spanAttributes['deployment.environment.name'], 'staging');
+});
+
+test('node version 1 keeps legacy nested capture settings', async () => {
+	const model = { callbacks: [] };
+	const httpCalls = [];
+	const ctx = fakeCtx({
+		model,
+		httpCalls,
+		executionId: 'exec-supply-data-v1-legacy',
+		typeVersion: 1,
+		executionContext: { redaction: { version: 1, policy: 'none' } },
+		parameters: {
+			options: { capturePrompts: true, captureToolIO: false },
+		},
+	});
+
+	await new TraceExporter().supplyData.call(ctx, 0);
+	const handler = model.callbacks[0];
+	handler.handleChatModelStart(
+		{ id: ['langchain', 'chat_models', 'openai', 'ChatOpenAI'], kwargs: { model: 'gpt-4o-mini' } },
+		[[{ content: 'legacy visible prompt' }]],
+		'run-v1-legacy',
+	);
+	handler.handleLLMEnd({}, 'run-v1-legacy');
+	await flushMicrotasks();
+	await flushMicrotasks();
+
+	const spans = httpCalls.flatMap((call) =>
+		call.body.resourceSpans.flatMap((resource) =>
+			resource.scopeSpans.flatMap((scope) => scope.spans),
+		),
+	);
+	const llmSpan = spans.find((span) => span.name === 'chat gpt-4o-mini');
+	const attributes = Object.fromEntries(
+		llmSpan.attributes.map(({ key, value }) => [key, value.stringValue]),
+	);
+	assert.match(String(attributes['gen_ai.input.messages']), /legacy visible prompt/);
 });
 
 test('export POSTs carry a bounded timeout so a hung backend cannot pin the in-flight slot', async () => {
@@ -164,7 +516,10 @@ test('export POSTs carry a bounded timeout so a hung backend cannot pin the in-f
 		[[{ content: 'hi' }]],
 		'run-1',
 	);
-	handler.handleLLMEnd({ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } }, 'run-1');
+	handler.handleLLMEnd(
+		{ llmOutput: { tokenUsage: { promptTokens: 3, completionTokens: 1 } } },
+		'run-1',
+	);
 	await flushMicrotasks();
 	await flushMicrotasks();
 

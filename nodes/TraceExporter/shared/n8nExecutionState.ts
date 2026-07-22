@@ -11,10 +11,25 @@ type RunDetails = {
 
 export type ExecutionStateHandler = TracingHooks & { awaitHandlers: true };
 
-export interface TraceContext {
-	traceId: string;
-	rootSpanId: string;
-}
+/**
+ * Execution-facing state for one trace. `queued` only means the exporter
+ * accepted at least one span for background delivery; it never claims that
+ * the backend received it. Unsampled traces deliberately expose no IDs so a
+ * generated local context cannot be mistaken for an exported trace.
+ */
+export type TraceExecutionContext =
+	| {
+			tracing: 'attached';
+			sampling: 'sampled';
+			traceId: string;
+			rootSpanId: string;
+			exportStatus?: 'queued';
+	  }
+	| {
+			tracing: 'attached';
+			sampling: 'notSampled';
+			exportStatus: 'notSampled';
+	  };
 
 /**
  * Report this passthrough model as an executed n8n sub-node.
@@ -32,7 +47,7 @@ export interface TraceContext {
  */
 export function createExecutionStateHandler(
 	ctx: ISupplyDataFunctions,
-	getTraceContext?: () => TraceContext | undefined,
+	getTraceContext?: () => TraceExecutionContext | undefined,
 ): ExecutionStateHandler {
 	const runs = new Map<string, RunDetails>();
 
